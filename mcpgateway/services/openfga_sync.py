@@ -263,14 +263,17 @@ class OpenFgaSyncService:
         desired = self.desired_tuples()
         stored_raw = await self._client.read_tuples()
         stored: dict[tuple[str, str, str], Optional[dict[str, Any]]] = {}
-        for t in stored_raw:
-            if not isinstance(t, dict) or not all(k in t for k in ("user", "relation", "object")):
+        for entry in stored_raw:
+            if not isinstance(entry, dict):
                 continue
-            condition = t.get("condition")
+            key = entry.get("key", entry)
+            if not isinstance(key, dict) or not all(k in key for k in ("user", "relation", "object")):
+                continue
+            condition = entry.get("condition")
             if isinstance(condition, dict) and condition.get("name"):
-                stored[(t["user"], t["relation"], t["object"])] = {"name": condition["name"], "context": condition.get("context", {})}
+                stored[(key["user"], key["relation"], key["object"])] = {"name": condition["name"], "context": condition.get("context", {})}
             else:
-                stored[(t["user"], t["relation"], t["object"])] = None
+                stored[(key["user"], key["relation"], key["object"])] = None
         writes = []
         for key in sorted(set(desired) - set(stored)):
             entry: dict[str, Any] = {"user": key[0], "relation": key[1], "object": key[2]}
