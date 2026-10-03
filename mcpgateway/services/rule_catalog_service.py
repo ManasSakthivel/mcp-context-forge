@@ -399,6 +399,12 @@ class RuleCatalogService:
             )
             matching = list(self._db.execute(stmt).scalars())
         except Exception as exc:  # pylint: disable=broad-exception-caught
+            # A failed query aborts the session transaction on psycopg;
+            # roll back so later statements on this session still run.
+            try:
+                self._db.rollback()
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
             logger.error("Rule catalog overlay unavailable; base decision stands: permission=%s error=%s", permission, exc)
             return None
         for rule in matching:
