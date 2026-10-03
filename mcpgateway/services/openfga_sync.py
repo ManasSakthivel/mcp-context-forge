@@ -269,7 +269,8 @@ class OpenFgaSyncService:
             key = entry.get("key", entry)
             if not isinstance(key, dict) or not all(k in key for k in ("user", "relation", "object")):
                 continue
-            condition = entry.get("condition")
+            # v1.8.x returns the condition nested inside the key object.
+            condition = entry.get("condition") or key.get("condition")
             if isinstance(condition, dict) and condition.get("name"):
                 stored[(key["user"], key["relation"], key["object"])] = {"name": condition["name"], "context": condition.get("context", {})}
             else:
