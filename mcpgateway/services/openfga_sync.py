@@ -288,6 +288,9 @@ class OpenFgaSyncService:
             deletes.append({"user": key[0], "relation": key[1], "object": key[2]})
         await self._client.write_tuples(writes, deletes)
         if writes or deletes:
+            from mcpgateway.services.openfga_provider import clear_decision_cache  # pylint: disable=import-outside-toplevel
+
+            clear_decision_cache()
             logger.info("OpenFGA resync applied: writes=%d deletes=%d", len(writes), len(deletes))
         return len(writes) + len(deletes)
 
