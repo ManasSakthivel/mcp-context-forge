@@ -433,6 +433,25 @@ def build_contextual_domain_tuples(
         return tuples
 
     # Fallback: read email_team_members and user_roles from the database.
+    try:
+        return _build_db_fallback_tuples(db, user_email, admin_role_names)
+    except Exception:  # pylint: disable=broad-exception-caught
+        logger.debug("Contextual domain tuple fallback failed", exc_info=True)
+        return tuples
+
+
+def _build_db_fallback_tuples(db: Any, user_email: str, admin_role_names: set[str]) -> list[dict[str, str]]:
+    """Build domain tuples from the database fallback.
+
+    Args:
+        db: Database session.
+        user_email: The principal identity.
+        admin_role_names: Role names that elevate to domain admin.
+
+    Returns:
+        Contextual tuples from email_team_members and user_roles.
+    """
+    tuples: list[dict[str, str]] = []
     from mcpgateway.db import EmailTeam, EmailTeamMember, UserRole  # pylint: disable=import-outside-toplevel
 
     teams = {t.id: domain_object_id(t.name) for t in db.execute(select(EmailTeam)).scalars()}
