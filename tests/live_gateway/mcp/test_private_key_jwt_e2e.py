@@ -135,12 +135,58 @@ class _CaptureStore:
             return self._records[-1]
 
 
-def _make_token_endpoint_app(store: _CaptureStore) -> Starlette:
-    """Stub Authorization Server token endpoint that always grants and records requests."""
+def _make_token_endpoint_app(store: _CaptureStore, public_pem: str, expected_audience: str) -> Starlette:
+    """Stub Authorization Server token endpoint that verifies the assertion before granting.
+
+    A stub that grants unconditionally proves only that some string arrived in
+    ``client_assertion``. It would mint a token for a garbage assertion, an
+    unsigned one, or one signed by the wrong key, so the test could not tell a
+    working signature from a broken one. This endpoint instead performs the
+    checks a real authorization server performs (RFC 7523 Section 3): verify the
+    signature against the registered public key, require RS256, and validate
+    ``aud``, ``iss``, ``sub``, and ``exp``.
+
+    Rejections are recorded too, so a test can assert the gateway was refused
+    and read back why.
+
+    Args:
+        store: Capture store for request bodies and verification outcomes.
+        public_pem: The registered public key, used to verify the assertion.
+        expected_audience: The ``aud`` the assertion must carry, which is the
+            ``token_url`` the gateway was configured with.
+
+    Returns:
+        Starlette: ASGI app exposing ``POST /token``.
+    """
 
     async def token(request: Request):
         form = OrderedDict((key, value) for key, value in (await request.form()).items())
-        store.record(form)
+
+        assertion = form.get("client_assertion")
+        if not assertion:
+            store.record(OrderedDict(list(form.items()) + [("_verified", False), ("_reason", "missing client_assertion")]))
+            return JSONResponse({"error": "invalid_client", "error_description": "missing client_assertion"}, status_code=401)
+
+        try:
+            # algorithms is pinned so an assertion claiming alg=none, or an HS*
+            # assertion forged with the public key as the shared secret, is
+            # rejected rather than accepted.
+            claims = pyjwt.decode(
+                assertion,
+                public_pem,
+                algorithms=["RS256"],
+                audience=expected_audience,
+                options={"require": ["exp", "iat", "iss", "sub", "aud", "jti"]},
+            )
+        except Exception as exc:  # noqa: BLE001 - any failure is a refusal
+            store.record(OrderedDict(list(form.items()) + [("_verified", False), ("_reason", f"{type(exc).__name__}: {exc}")]))
+            return JSONResponse({"error": "invalid_client", "error_description": "assertion verification failed"}, status_code=401)
+
+        if claims.get("iss") != _STUB_CLIENT_ID or claims.get("sub") != _STUB_CLIENT_ID:
+            store.record(OrderedDict(list(form.items()) + [("_verified", False), ("_reason", "iss/sub mismatch")]))
+            return JSONResponse({"error": "invalid_client", "error_description": "iss/sub mismatch"}, status_code=401)
+
+        store.record(OrderedDict(list(form.items()) + [("_verified", True), ("_reason", "")]))
         return JSONResponse(
             {
                 "access_token": _STUB_ACCESS_TOKEN,
@@ -244,11 +290,14 @@ def stub_stack(rsa_keypair: dict[str, str]) -> Generator[dict[str, Any], None, N
     mcp_store = _CaptureStore()
     token_port = _free_port()
     mcp_port = _free_port()
-    token_server, token_thread = _serve_uvicorn(_make_token_endpoint_app(token_store), token_port, "as")
+    # The gateway sets aud to the configured token_url, so the stub must expect
+    # that exact string, including the host.docker.internal hostname it dials.
+    expected_audience = f"http://host.docker.internal:{token_port}/token"
+    token_server, token_thread = _serve_uvicorn(_make_token_endpoint_app(token_store, rsa_keypair["public"], expected_audience), token_port, "as")
     mcp_server, mcp_thread = _serve_uvicorn(_make_upstream_mcp_app(mcp_store), mcp_port, "upstream")
     try:
         yield {
-            "token_url": f"http://host.docker.internal:{token_port}/token",
+            "token_url": expected_audience,
             "mcp_url": f"http://host.docker.internal:{mcp_port}/mcp",
             "public_pem": rsa_keypair["public"],
             "token_store": token_store,
@@ -377,6 +426,11 @@ def _verify_assertion(stub_stack: dict[str, Any], token_request: OrderedDict[str
     assert token_request.get("client_assertion_type") == "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
     assertion = token_request.get("client_assertion")
     assert assertion and isinstance(assertion, str), "missing client_assertion"
+
+    # The stub AS verified the signature, aud, iss, sub and exp before issuing.
+    # Asserting that here is what separates "a token came back" from "a valid
+    # assertion was accepted"; the stub records its reason on refusal.
+    assert token_request.get("_verified") is True, f"stub AS refused the assertion: {token_request.get('_reason')}"
 
     # The point of private_key_jwt is that no shared secret crosses the wire.
     # Asserting the assertion is present does not prove that, since a fallback
