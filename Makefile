@@ -1007,7 +1007,7 @@ test-private-key-jwt-live: uv  ## Black-box test for RFC 7523 private_key_jwt to
 	@echo "🧪 Running private_key_jwt live tests against $${MCP_CLI_BASE_URL:-http://localhost:8080}..."
 	@echo "   Requires: docker-compose stack; stub AS/upstream run on host.docker.internal"
 	@echo "   LIVE_GATEWAY_REQUIRED=1: an unreachable gateway fails here instead of skipping."
-	@LIVE_GATEWAY_REQUIRED=1 $(UV_BIN) run pytest tests/live_gateway/mcp/test_private_key_jwt_e2e.py -v -s --tb=short \
+	@LIVE_GATEWAY_REQUIRED=1 $(UV_BIN) run pytest -p playwright tests/live_gateway/mcp/test_private_key_jwt_e2e.py -v -s --tb=short \
 		|| { echo "❌ private_key_jwt live tests failed!"; exit 1; }
 	@echo "✅ private_key_jwt live tests passed!"
 

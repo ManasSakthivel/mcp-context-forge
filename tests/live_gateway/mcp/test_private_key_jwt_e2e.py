@@ -56,6 +56,7 @@ import httpx2
 import jwt as pyjwt
 from mcp.server import ServerRequestContext
 from mcp.server.lowlevel import Server
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams, TextContent, Tool
 import pytest
 from starlette.applications import Starlette
@@ -66,10 +67,9 @@ import uvicorn
 
 pw = pytest.importorskip("playwright", reason="playwright is not installed – pip install playwright")
 # Third-Party
-from playwright.sync_api import APIRequestContext, Playwright  # noqa: E402
 
 # Local
-from tests.helpers.auth import make_playwright_api_context, make_test_jwt  # noqa: E402
+from tests.helpers.auth import make_test_jwt  # noqa: E402
 from ..helpers.mcp_test_helpers import ADMIN_EMAIL, BASE_URL, JWT_SECRET, skip_no_gateway  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -178,7 +178,15 @@ def _make_upstream_mcp_app(store: _CaptureStore) -> Any:
         on_list_tools=list_tools,
         on_call_tool=call_tool,
     )
-    mcp_app = server.streamable_http_app(streamable_http_path="/mcp")
+    # The compose gateway reaches this stub through host.docker.internal, so the
+    # Host header never matches the SDK's default 127.0.0.1 allowlist and the
+    # request is rejected with 421 Misdirected Request. DNS-rebinding protection
+    # is off here because the stub is bound to an ephemeral port on the test
+    # host for the duration of one module.
+    mcp_app = server.streamable_http_app(
+        streamable_http_path="/mcp",
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
 
     async def wrapped_mcp_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] == "http" and scope["path"] == "/mcp":
@@ -194,12 +202,23 @@ def _make_upstream_mcp_app(store: _CaptureStore) -> Any:
 # Fixtures
 # ---------------------------------------------------------------------------
 @pytest.fixture(scope="module")
-def admin_api(playwright: Playwright) -> Generator[APIRequestContext, None, None]:
-    """Admin API context using a ContextForge-issued JWT."""
+def admin_api() -> Generator[httpx2.Client, None, None]:
+    """Admin API client using a ContextForge-issued JWT.
+
+    Uses httpx rather than Playwright's ``APIRequestContext``. Playwright's
+    ``playwright`` fixture drives a synchronous greenlet event loop, and once it
+    is instantiated in a module, every async fixture in that module fails setup
+    with "Runner.run() cannot be called from a running event loop". This module
+    needs both an async MCP client session and HTTP admin calls, so the admin
+    calls use an async-compatible client.
+
+    Methods mirror the small slice of the Playwright surface this module used
+    (``.status_code`` and ``.text``), so the assertions stay close to the
+    original.
+    """
     token = make_test_jwt(ADMIN_EMAIL, is_admin=True, teams=None, secret=JWT_SECRET)
-    ctx = make_playwright_api_context(playwright, BASE_URL, token)
-    yield ctx
-    ctx.dispose()
+    with httpx2.Client(base_url=BASE_URL, headers={"Authorization": f"Bearer {token}"}, timeout=30.0) as client:
+        yield client
 
 
 @pytest.fixture(scope="module")
@@ -241,7 +260,7 @@ def stub_stack(rsa_keypair: dict[str, str]) -> Generator[dict[str, Any], None, N
 
 
 @pytest.fixture(scope="module")
-def private_key_jwt_gateway(admin_api: APIRequestContext, stub_stack: dict[str, Any], rsa_keypair: dict[str, str]) -> Generator[dict[str, Any], None, None]:
+def private_key_jwt_gateway(admin_api: httpx2.Client, stub_stack: dict[str, Any], rsa_keypair: dict[str, str]) -> Generator[dict[str, Any], None, None]:
     """Register a private_key_jwt OAuth gateway against the stub upstream and wait for its tools."""
     name = f"pkce-e2e-{uuid.uuid4().hex[:8]}"
     payload = {
@@ -261,8 +280,8 @@ def private_key_jwt_gateway(admin_api: APIRequestContext, stub_stack: dict[str, 
             "private_key_jwt_kid": _STUB_KEY_ID,
         },
     }
-    resp = admin_api.post("/gateways", data=payload)
-    assert resp.status in (200, 201), f"Failed to register private_key_jwt gateway: {resp.status} {resp.text()}"
+    resp = admin_api.post("/gateways", json=payload)
+    assert resp.status_code in (200, 201), f"Failed to register private_key_jwt gateway: {resp.status_code} {resp.text}"
     gateway = resp.json()
     gateway_id = gateway["id"]
     logger.info("Registered private_key_jwt gateway %s (id=%s)", name, gateway_id)
@@ -275,7 +294,7 @@ def private_key_jwt_gateway(admin_api: APIRequestContext, stub_stack: dict[str, 
         tool_name = None
         while time.monotonic() < deadline:
             tools_resp = admin_api.get("/tools")
-            if tools_resp.status == 200:
+            if tools_resp.status_code == 200:
                 tools = tools_resp.json()
                 matched = [tool for tool in tools if tool.get("name", "").endswith("-stub-echo")]
                 if matched:
@@ -294,8 +313,20 @@ def private_key_jwt_gateway(admin_api: APIRequestContext, stub_stack: dict[str, 
 
 
 @pytest.fixture
-async def hub_client(private_key_jwt_gateway: dict[str, Any]):
-    """An MCP client session against the live hub endpoint (``/mcp/``)."""
+async def hub_client():
+    """An MCP client session against the live hub endpoint (``/mcp/``).
+
+    Deliberately declares no fixture dependencies. Playwright's ``playwright``
+    fixture is synchronous and drives its own greenlet event loop, so an async
+    fixture that depends on it (directly or through ``admin_api`` ->
+    ``private_key_jwt_gateway``) fails in setup with "Runner.run() cannot be
+    called from a running event loop". The working precedent in
+    ``tests/live_gateway/e2e/test_e2e.py`` keeps its async ``client`` fixture
+    free of Playwright for the same reason.
+
+    Tests that need both request ``private_key_jwt_gateway`` themselves, which
+    keeps the Playwright chain on the synchronous side of the boundary.
+    """
     import asyncio  # noqa: PLC0415
 
     from mcp import ClientSession  # noqa: PLC0415
@@ -396,14 +427,14 @@ class TestPrivateKeyJwtLiveFlow:
         assert mcp_capture is not None, "the stub upstream never received an MCP request"
         assert mcp_capture.get("authorization") == f"Bearer {_STUB_ACCESS_TOKEN}", f"upstream auth header mismatch: {mcp_capture.get('authorization')!r}"
 
-    def test_registration_masks_private_key(self, admin_api: APIRequestContext, private_key_jwt_gateway: dict[str, Any]) -> None:
+    def test_registration_masks_private_key(self, admin_api: httpx2.Client, private_key_jwt_gateway: dict[str, Any]) -> None:
         """The saved gateway never echoes the raw signing key back through the API."""
         resp = admin_api.get(f"/gateways/{private_key_jwt_gateway['id']}")
-        assert resp.status == 200, resp.text()
-        body = resp.text()
+        assert resp.status_code == 200, resp.text
+        body = resp.text
         assert "BEGIN PRIVATE KEY" not in body and "BEGIN RSA PRIVATE KEY" not in body, "private_key leaked through API"  # pragma: allowlist secret
 
-    def test_invalid_method_rejected_with_422(self, admin_api: APIRequestContext) -> None:
+    def test_invalid_method_rejected_with_422(self, admin_api: httpx2.Client) -> None:
         """An unsupported token_endpoint_auth_method fails closed at the live API boundary."""
         name = f"pkce-e2e-invalid-{uuid.uuid4().hex[:8]}"
         payload = {
@@ -418,10 +449,10 @@ class TestPrivateKeyJwtLiveFlow:
                 "token_endpoint_auth_method": "client_secret_digest",
             },
         }
-        resp = admin_api.post("/gateways", data=payload)
-        assert resp.status == 422, f"expected 422 for unsupported method, got {resp.status} {resp.text()}"
+        resp = admin_api.post("/gateways", json=payload)
+        assert resp.status_code == 422, f"expected 422 for unsupported method, got {resp.status_code} {resp.text}"
 
-    def test_hs256_signing_alg_rejected_with_422(self, admin_api: APIRequestContext) -> None:
+    def test_hs256_signing_alg_rejected_with_422(self, admin_api: httpx2.Client) -> None:
         """An HMAC signing algorithm for assertions fails closed at the live API boundary."""
         name = f"pkce-e2e-invalid-alg-{uuid.uuid4().hex[:8]}"
         payload = {
@@ -438,5 +469,5 @@ class TestPrivateKeyJwtLiveFlow:
                 "private_key": "not-a-real-key",  # pragma: allowlist secret - fixture literal
             },
         }
-        resp = admin_api.post("/gateways", data=payload)
-        assert resp.status == 422, f"expected 422 for HS256, got {resp.status} {resp.text()}"
+        resp = admin_api.post("/gateways", json=payload)
+        assert resp.status_code == 422, f"expected 422 for HS256, got {resp.status_code} {resp.text}"
