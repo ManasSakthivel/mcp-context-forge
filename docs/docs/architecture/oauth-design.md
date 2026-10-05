@@ -119,7 +119,7 @@ The gateway configuration form maps user inputs to the OAuth configuration struc
 
 ### Audience handling and RFC 8707
 
-The gateway implements [RFC 8707](https://datatools.ietf.org/doc/html/rfc8707) (Resource Indicators for OAuth 2.0) to ensure that access tokens are correctly scoped for the target MCP server.
+The gateway implements [RFC 8707](https://datatracker.ietf.org/doc/html/rfc8707) (Resource Indicators for OAuth 2.0) to ensure that access tokens are correctly scoped for the target MCP server.
 
 #### The `resource` parameter
 

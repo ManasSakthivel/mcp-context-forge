@@ -650,8 +650,10 @@ class OAuthManager:
             token_data: Token request form data to extend.
             headers: Token request headers to extend.
             runtime_credentials: Runtime-ready OAuth configuration after decryption.
-            require_client_id: Whether a missing client_id is an error.
-                True for all flows except the password grant.
+            require_client_id: Whether a missing client_id is an error. True for
+                every flow except the password grant (RFC 6749 Section 4.3) and
+                RFC 8693 token exchange, which both pass False. See the note
+                above for the two methods that override this either way.
 
         Raises:
             OAuthError: If the configured method is unknown or required signing
