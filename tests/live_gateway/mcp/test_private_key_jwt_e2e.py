@@ -73,12 +73,9 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 import uvicorn
 
-pw = pytest.importorskip("playwright", reason="playwright is not installed – pip install playwright")
-# Third-Party
-
 # Local
-from tests.helpers.auth import make_test_jwt  # noqa: E402
-from ..helpers.mcp_test_helpers import ADMIN_EMAIL, BASE_URL, JWT_SECRET, skip_no_gateway  # noqa: E402
+from ..helpers.mcp_test_helpers import ADMIN_EMAIL, BASE_URL, JWT_SECRET, skip_no_gateway
+from tests.helpers.auth import make_test_jwt
 
 logger = logging.getLogger(__name__)
 
@@ -259,16 +256,15 @@ def _make_upstream_mcp_app(store: _CaptureStore) -> Any:
 def admin_api() -> Generator[httpx.Client, None, None]:
     """Admin API client using a ContextForge-issued JWT.
 
-    Uses httpx rather than Playwright's ``APIRequestContext``. Playwright's
-    ``playwright`` fixture drives a synchronous greenlet event loop, and once it
-    is instantiated in a module, every async fixture in that module fails setup
-    with "Runner.run() cannot be called from a running event loop". This module
-    needs both an async MCP client session and HTTP admin calls, so the admin
-    calls use an async-compatible client.
+    Uses httpx rather than Playwright's ``APIRequestContext``, which this module
+    used originally. Playwright's ``playwright`` fixture drives a synchronous
+    greenlet event loop, and once it is instantiated in a module, every async
+    fixture in that module fails setup with "Runner.run() cannot be called from
+    a running event loop". This module needs an async MCP client session
+    alongside the admin HTTP calls, so Playwright is no longer used here at all.
 
-    Methods mirror the small slice of the Playwright surface this module used
-    (``.status_code`` and ``.text``), so the assertions stay close to the
-    original.
+    httpx is also the declared dependency (``pyproject.toml``), where
+    ``APIRequestContext`` arrived through a test-only plugin.
     """
     token = make_test_jwt(ADMIN_EMAIL, is_admin=True, teams=None, secret=JWT_SECRET)
     with httpx.Client(base_url=BASE_URL, headers={"Authorization": f"Bearer {token}"}, timeout=30.0) as client:
@@ -373,19 +369,22 @@ def private_key_jwt_gateway(admin_api: httpx.Client, stub_stack: dict[str, Any],
 async def hub_client():
     """An MCP client session against the live hub endpoint (``/mcp/``).
 
-    Deliberately declares no fixture dependencies. Playwright's ``playwright``
-    fixture is synchronous and drives its own greenlet event loop, so an async
-    fixture that depends on it (directly or through ``admin_api`` ->
-    ``private_key_jwt_gateway``) fails in setup with "Runner.run() cannot be
-    called from a running event loop". The working precedent in
+    Declares no fixture dependencies on purpose. Any synchronous fixture that
+    drives its own event loop — Playwright's ``playwright`` fixture is the one
+    this module previously used — makes every async fixture in the same module
+    fail setup with "Runner.run() cannot be called from a running event loop".
+    Keeping this fixture dependency-free, and the admin client on httpx, is what
+    lets an async MCP session and the admin HTTP calls coexist here.
     ``tests/live_gateway/e2e/test_e2e.py`` keeps its async ``client`` fixture
-    free of Playwright for the same reason.
+    free of such fixtures for the same reason.
 
-    Tests that need both request ``private_key_jwt_gateway`` themselves, which
-    keeps the Playwright chain on the synchronous side of the boundary.
+    Tests that also need the registered gateway request
+    ``private_key_jwt_gateway`` themselves.
     """
+    # Standard
     import asyncio  # noqa: PLC0415
 
+    # Third-Party
     from mcp import ClientSession  # noqa: PLC0415
     from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client  # noqa: PLC0415
 
