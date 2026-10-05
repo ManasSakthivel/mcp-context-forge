@@ -624,12 +624,27 @@ class OAuthManager:
 
         Mutates ``token_data`` (form body) and ``headers`` (request headers)
         with the client mechanism selected by ``token_endpoint_auth_method``.
-        When ``require_client_id`` is false, a missing client_id is not an
-        error and the id is sent only when configured for methods that allow it.
+
+        ``require_client_id`` controls only whether a *missing* client_id is an
+        error. Two methods override it in opposite directions:
+
+        - ``none`` never requires a client_id, even when ``require_client_id`` is
+          true. RFC 7591 Section 2 defines it as the public-client method, so the
+          id is sent only when one is configured.
+        - ``private_key_jwt`` always requires a client_id, even when
+          ``require_client_id`` is false, because RFC 7523 Section 3 derives
+          ``iss`` and ``sub`` from it. The requirement is enforced in
+          ``_build_client_assertion``, so a token-exchange or password-grant
+          caller that passes ``require_client_id=False`` still fails without one.
+
         The password grant (RFC 6749 Section 4.3) historically allowed a client
-        without credentials, so it calls this method with ``require_client_id=False``.
-        Note: ``private_key_jwt`` always requires ``client_id`` (for iss/sub per
-        RFC 7523), regardless of ``require_client_id`` flag.
+        without credentials, so it is the caller that passes
+        ``require_client_id=False``.
+
+        The method itself is validated before any branch runs. An unsupported or
+        non-string value raises rather than falling through to the
+        ``client_secret_post`` tail, so a misconfiguration can never be silently
+        downgraded to a different mechanism.
 
         Args:
             token_data: Token request form data to extend.

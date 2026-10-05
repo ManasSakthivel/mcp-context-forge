@@ -60,7 +60,7 @@ Stored as JSON within the gateway record and assembled from Admin UI fields or A
 
 ### Private-Key JWT Client Authentication (RFC 7523)
 
-Gateways may authenticate to the token endpoint with a signed JWT instead of a shared client secret, as defined in [RFC 7523](https://datatools.ietf.org/doc/html/rfc7523). This is the standard confidential-client method for providers such as Microsoft Entra ID and Keycloak that issue JWKS to verify client assertions.
+Gateways may authenticate to the token endpoint with a signed JWT instead of a shared client secret, as defined in [RFC 7523](https://datatracker.ietf.org/doc/html/rfc7523). This is the standard confidential-client method for providers such as Microsoft Entra ID and Keycloak that issue JWKS to verify client assertions.
 
 Configured on the `oauth_config` object:
 

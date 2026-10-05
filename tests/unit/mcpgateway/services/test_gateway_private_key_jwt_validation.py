@@ -22,7 +22,7 @@ import pytest
 from mcpgateway.common.oauth import _EC_SIGNING_ALG_CURVES, SUPPORTED_TOKEN_ENDPOINT_SIGNING_ALGS, validate_private_key_material
 from mcpgateway.config import settings
 from mcpgateway.schemas import GatewayUpdate
-from mcpgateway.services.encryption_service import get_encryption_service
+from mcpgateway.services.encryption_service import get_encryption_service, protect_oauth_config_for_storage
 from mcpgateway.services.gateway_service import GatewayError, GatewayService
 
 MALFORMED_KEY = "dummy-private-key-material"  # pragma: allowlist secret
@@ -367,3 +367,109 @@ class TestUpdatePathRejectsMalformedKey:
 
         await service.update_gateway(db, "gw-pkjwt", update)
         db.rollback.assert_not_called()
+
+
+class TestPrivateKeyLifecycle:
+    """The signing key from submission through storage, rotation and use.
+
+    ``private_key`` is listed in ``OAUTH_SENSITIVE_KEYS``, but no test covered it
+    through ``protect_oauth_config_for_storage``. These tests pin the properties a
+    reviewer needs to trust: the raw PEM never persists, an update that keeps the
+    key does not rotate it, and a key that survives the storage round trip can
+    still sign.
+    """
+
+    @staticmethod
+    def _service():
+        """Return the encryption service bound to the configured secret.
+
+        Returns:
+            EncryptionService: Service used for the storage round trip.
+        """
+        return get_encryption_service(settings.auth_encryption_secret)
+
+    @pytest.mark.asyncio
+    async def test_raw_pem_never_persists(self):
+        original = _rsa_pem()
+        stored = await protect_oauth_config_for_storage({"token_endpoint_auth_method": "private_key_jwt", "private_key": original})
+
+        assert self._service().is_encrypted(stored["private_key"])
+        assert "BEGIN PRIVATE KEY" not in stored["private_key"]  # pragma: allowlist secret
+        assert original not in stored["private_key"]
+
+    @pytest.mark.asyncio
+    async def test_storage_round_trip_is_lossless(self):
+        # A key that changes under encryption would fail at sign time rather than
+        # at configuration time, so the round trip must be exact.
+        original = _rsa_pem()
+        stored = await protect_oauth_config_for_storage({"token_endpoint_auth_method": "private_key_jwt", "private_key": original})
+
+        assert self._service().decrypt_secret(stored["private_key"]) == original
+
+    @pytest.mark.asyncio
+    async def test_masked_update_preserves_the_stored_key(self):
+        # Editing an unrelated field resubmits the mask. Treating that as new key
+        # material would silently rotate the key and break the gateway.
+        stored = await protect_oauth_config_for_storage({"token_endpoint_auth_method": "private_key_jwt", "private_key": _rsa_pem()})
+        updated = await protect_oauth_config_for_storage(
+            {"token_endpoint_auth_method": "private_key_jwt", "private_key": settings.masked_auth_value},
+            existing_oauth_config=stored,
+        )
+
+        assert updated["private_key"] == stored["private_key"]
+
+    @pytest.mark.asyncio
+    async def test_resubmitted_ciphertext_is_not_double_encrypted(self):
+        # A client that reads the config back and submits it unchanged must not
+        # cause a second encryption pass, which would make the key undecryptable.
+        stored = await protect_oauth_config_for_storage({"token_endpoint_auth_method": "private_key_jwt", "private_key": _rsa_pem()})
+        updated = await protect_oauth_config_for_storage(
+            {"token_endpoint_auth_method": "private_key_jwt", "private_key": stored["private_key"]},
+            existing_oauth_config=stored,
+        )
+
+        assert updated["private_key"] == stored["private_key"]
+        assert self._service().decrypt_secret(updated["private_key"]) == self._service().decrypt_secret(stored["private_key"])
+
+    @pytest.mark.asyncio
+    async def test_rotation_replaces_the_stored_key(self):
+        old_pem = _rsa_pem()
+        new_pem = _rsa_pem()
+        stored = await protect_oauth_config_for_storage({"token_endpoint_auth_method": "private_key_jwt", "private_key": old_pem})
+        rotated = await protect_oauth_config_for_storage(
+            {"token_endpoint_auth_method": "private_key_jwt", "private_key": new_pem},
+            existing_oauth_config=stored,
+        )
+
+        assert rotated["private_key"] != stored["private_key"]
+        assert self._service().decrypt_secret(rotated["private_key"]) == new_pem
+
+    @pytest.mark.asyncio
+    async def test_key_still_signs_after_the_storage_round_trip(self):
+        # The end-to-end property the feature rests on: a key that was validated,
+        # encrypted, stored and decrypted can still produce a verifiable
+        # assertion. Each step above is checked in isolation; this is the
+        # composition.
+        # Third-Party
+        import jwt as pyjwt
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        original = _pem(key)
+        public_pem = key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+
+        GatewayService._validate_private_key_jwt_config({"token_endpoint_auth_method": "private_key_jwt", "private_key": original})
+        stored = await protect_oauth_config_for_storage({"token_endpoint_auth_method": "private_key_jwt", "private_key": original})
+        recovered = self._service().decrypt_secret(stored["private_key"])
+
+        assertion = pyjwt.encode({"iss": "c1", "sub": "c1", "aud": "https://issuer.example.com/token"}, recovered, algorithm="RS256")
+        claims = pyjwt.decode(assertion, public_pem, algorithms=["RS256"], audience="https://issuer.example.com/token")
+        assert claims["iss"] == "c1"
+
+    @pytest.mark.asyncio
+    async def test_gate_accepts_the_stored_form_on_a_later_update(self):
+        # The gate and the storage layer must agree: whatever storage produces has
+        # to be a value the gate skips, or an unrelated field edit would be
+        # rejected on every subsequent update.
+        stored = await protect_oauth_config_for_storage({"token_endpoint_auth_method": "private_key_jwt", "private_key": _rsa_pem()})
+
+        GatewayService._validate_private_key_jwt_config({"token_endpoint_auth_method": "private_key_jwt", "private_key": stored["private_key"]})

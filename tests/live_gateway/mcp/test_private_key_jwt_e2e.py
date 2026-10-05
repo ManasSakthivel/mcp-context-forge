@@ -533,3 +533,33 @@ class TestPrivateKeyJwtLiveFlow:
         }
         resp = admin_api.post("/gateways", json=payload)
         assert resp.status_code == 422, f"expected 422 for HS256, got {resp.status_code} {resp.text}"
+
+    def test_unauthenticated_registration_is_rejected(self) -> None:
+        """An unauthenticated caller cannot register a private_key_jwt gateway.
+
+        ``POST /gateways`` is gated on ``gateways.create``. AGENTS.md requires a
+        deny-path test for security-sensitive changes, and this is the one that
+        matters most here: the request body carries signing key material, so the
+        rejection must happen before anything is persisted and the key must not
+        come back in the error.
+        """
+        sentinel = "SENTINEL-UNAUTH-KEY-MATERIAL"
+        payload = {
+            "name": f"pkce-e2e-unauth-{uuid.uuid4().hex[:8]}",
+            "url": "https://mcp.example.com/mcp",
+            "transport": "STREAMABLEHTTP",
+            "auth_type": "oauth",
+            "oauth_config": {
+                "grant_type": "client_credentials",
+                "client_id": _STUB_CLIENT_ID,
+                "token_url": "https://idp.example.com/token",
+                "token_endpoint_auth_method": "private_key_jwt",
+                "private_key": f"-----BEGIN PRIVATE KEY-----\n{sentinel}\n-----END PRIVATE KEY-----",  # pragma: allowlist secret - fixture literal
+            },
+        }
+        # A client with no Authorization header, unlike the admin_api fixture.
+        with httpx.Client(base_url=BASE_URL, timeout=30.0) as anonymous:
+            resp = anonymous.post("/gateways", json=payload)
+
+        assert resp.status_code == 401, f"expected 401 for an unauthenticated caller, got {resp.status_code} {resp.text}"
+        assert sentinel not in resp.text, "the rejection echoed the submitted key material"
