@@ -52,6 +52,14 @@ import uuid
 # Third-Party
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+
+# httpx for this module's own admin calls: it is the declared dependency
+# (pyproject.toml "httpx>=0.28.1"). httpx2 only where the mcp SDK's signature
+# requires it -- create_mcp_http_client is typed (timeout: httpx2.Timeout) and
+# returns httpx2.AsyncClient. The two are separate installed packages, not
+# aliases, and httpx2 reaches the environment transitively through mcp, cpex and
+# starlette rather than through a direct declaration.
+import httpx
 import httpx2
 import jwt as pyjwt
 from mcp.server import ServerRequestContext
@@ -248,7 +256,7 @@ def _make_upstream_mcp_app(store: _CaptureStore) -> Any:
 # Fixtures
 # ---------------------------------------------------------------------------
 @pytest.fixture(scope="module")
-def admin_api() -> Generator[httpx2.Client, None, None]:
+def admin_api() -> Generator[httpx.Client, None, None]:
     """Admin API client using a ContextForge-issued JWT.
 
     Uses httpx rather than Playwright's ``APIRequestContext``. Playwright's
@@ -263,7 +271,7 @@ def admin_api() -> Generator[httpx2.Client, None, None]:
     original.
     """
     token = make_test_jwt(ADMIN_EMAIL, is_admin=True, teams=None, secret=JWT_SECRET)
-    with httpx2.Client(base_url=BASE_URL, headers={"Authorization": f"Bearer {token}"}, timeout=30.0) as client:
+    with httpx.Client(base_url=BASE_URL, headers={"Authorization": f"Bearer {token}"}, timeout=30.0) as client:
         yield client
 
 
@@ -309,7 +317,7 @@ def stub_stack(rsa_keypair: dict[str, str]) -> Generator[dict[str, Any], None, N
 
 
 @pytest.fixture(scope="module")
-def private_key_jwt_gateway(admin_api: httpx2.Client, stub_stack: dict[str, Any], rsa_keypair: dict[str, str]) -> Generator[dict[str, Any], None, None]:
+def private_key_jwt_gateway(admin_api: httpx.Client, stub_stack: dict[str, Any], rsa_keypair: dict[str, str]) -> Generator[dict[str, Any], None, None]:
     """Register a private_key_jwt OAuth gateway against the stub upstream and wait for its tools."""
     name = f"pkce-e2e-{uuid.uuid4().hex[:8]}"
     payload = {
@@ -481,14 +489,14 @@ class TestPrivateKeyJwtLiveFlow:
         assert mcp_capture is not None, "the stub upstream never received an MCP request"
         assert mcp_capture.get("authorization") == f"Bearer {_STUB_ACCESS_TOKEN}", f"upstream auth header mismatch: {mcp_capture.get('authorization')!r}"
 
-    def test_registration_masks_private_key(self, admin_api: httpx2.Client, private_key_jwt_gateway: dict[str, Any]) -> None:
+    def test_registration_masks_private_key(self, admin_api: httpx.Client, private_key_jwt_gateway: dict[str, Any]) -> None:
         """The saved gateway never echoes the raw signing key back through the API."""
         resp = admin_api.get(f"/gateways/{private_key_jwt_gateway['id']}")
         assert resp.status_code == 200, resp.text
         body = resp.text
         assert "BEGIN PRIVATE KEY" not in body and "BEGIN RSA PRIVATE KEY" not in body, "private_key leaked through API"  # pragma: allowlist secret
 
-    def test_invalid_method_rejected_with_422(self, admin_api: httpx2.Client) -> None:
+    def test_invalid_method_rejected_with_422(self, admin_api: httpx.Client) -> None:
         """An unsupported token_endpoint_auth_method fails closed at the live API boundary."""
         name = f"pkce-e2e-invalid-{uuid.uuid4().hex[:8]}"
         payload = {
@@ -506,7 +514,7 @@ class TestPrivateKeyJwtLiveFlow:
         resp = admin_api.post("/gateways", json=payload)
         assert resp.status_code == 422, f"expected 422 for unsupported method, got {resp.status_code} {resp.text}"
 
-    def test_hs256_signing_alg_rejected_with_422(self, admin_api: httpx2.Client) -> None:
+    def test_hs256_signing_alg_rejected_with_422(self, admin_api: httpx.Client) -> None:
         """An HMAC signing algorithm for assertions fails closed at the live API boundary."""
         name = f"pkce-e2e-invalid-alg-{uuid.uuid4().hex[:8]}"
         payload = {
