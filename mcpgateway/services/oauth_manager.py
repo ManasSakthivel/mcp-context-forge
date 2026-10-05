@@ -548,8 +548,10 @@ class OAuthManager:
             raise OAuthError("token_endpoint_auth_method is private_key_jwt but no private_key is configured")
 
         alg = runtime_credentials.get("token_endpoint_auth_signing_alg") or DEFAULT_TOKEN_ENDPOINT_SIGNING_ALG
+        if not isinstance(alg, str):
+            raise OAuthError("Unsupported token_endpoint_auth_signing_alg - must be a string")
         if alg not in SUPPORTED_TOKEN_ENDPOINT_SIGNING_ALGS:
-            raise OAuthError(f"Unsupported token_endpoint_auth_signing_alg '{sanitize_for_log(alg)}'. Supported values: {', '.join(sorted(SUPPORTED_TOKEN_ENDPOINT_SIGNING_ALGS))}")
+            raise OAuthError(f"Unsupported token_endpoint_auth_signing_alg. Supported values: {', '.join(sorted(SUPPORTED_TOKEN_ENDPOINT_SIGNING_ALGS))}")
 
         now = datetime.now(timezone.utc)
         payload = {
@@ -573,6 +575,31 @@ class OAuthManager:
         except Exception as exc:
             raise OAuthError("Failed to sign client assertion for private_key_jwt client authentication") from exc
 
+    async def _refresh_client_assertion(self, token_data: Any, runtime_credentials: Dict[str, Any]) -> None:
+        """Regenerate client assertion before retry if using private_key_jwt.
+
+        Args:
+            token_data: Token request form data to update (dict or list of tuples for form encoding).
+            runtime_credentials: Runtime OAuth config.
+        """
+        auth_method = runtime_credentials.get("token_endpoint_auth_method", "client_secret_post")
+        if auth_method is None or (isinstance(auth_method, str) and not auth_method.strip()):
+            auth_method = "client_secret_post"
+        if auth_method == "private_key_jwt":
+            new_assertion = await self._build_client_assertion(runtime_credentials)
+            if isinstance(token_data, dict):
+                token_data["client_assertion"] = new_assertion
+            elif isinstance(token_data, list):
+                # Update existing client_assertion if present, else append
+                replaced = False
+                for i, item in enumerate(token_data):
+                    if isinstance(item, tuple) and len(item) > 0 and item[0] == "client_assertion":
+                        token_data[i] = ("client_assertion", new_assertion)
+                        replaced = True
+                        break
+                if not replaced:
+                    token_data.append(("client_assertion", new_assertion))
+
     async def _apply_token_endpoint_auth(
         self,
         token_data: Dict[str, Any],
@@ -586,9 +613,11 @@ class OAuthManager:
         Mutates ``token_data`` (form body) and ``headers`` (request headers)
         with the client mechanism selected by ``token_endpoint_auth_method``.
         When ``require_client_id`` is false, a missing client_id is not an
-        error and the id is sent only when configured. The password grant
-        (RFC 6749 Section 4.3) historically allowed a client without
-        credentials, so it calls this method with ``require_client_id=False``.
+        error and the id is sent only when configured for methods that allow it.
+        The password grant (RFC 6749 Section 4.3) historically allowed a client
+        without credentials, so it calls this method with ``require_client_id=False``.
+        Note: ``private_key_jwt`` always requires ``client_id`` (for iss/sub per
+        RFC 7523), regardless of ``require_client_id`` flag.
 
         Args:
             token_data: Token request form data to extend.
@@ -605,11 +634,13 @@ class OAuthManager:
                 clients, which ensures the request still carries the client id.
         """
         auth_method = runtime_credentials.get("token_endpoint_auth_method", "client_secret_post")
+        # Normalize None/empty/whitespace
+        if auth_method is None or (isinstance(auth_method, str) and not auth_method.strip()):
+            auth_method = "client_secret_post"
+        if isinstance(auth_method, str):
+            auth_method = auth_method.strip()
         client_id = runtime_credentials.get("client_id")
         client_secret = runtime_credentials.get("client_secret")
-
-        if require_client_id and (not isinstance(client_id, str) or not client_id):
-            raise OAuthError("OAuth configuration missing client_id required for token endpoint authentication")
 
         if auth_method == "none":
             # RFC 7591 Section 2: public client with no authentication.
@@ -617,6 +648,9 @@ class OAuthManager:
                 token_data["client_id"] = client_id
             logger.debug("Using no authentication for token endpoint (public client)")
             return
+
+        if require_client_id and (not isinstance(client_id, str) or not client_id):
+            raise OAuthError("OAuth configuration missing client_id required for token endpoint authentication")
 
         if auth_method == "client_secret_basic":
             if client_id and client_secret:
@@ -639,8 +673,11 @@ class OAuthManager:
             logger.debug("Using private_key_jwt client assertion for token endpoint authentication")
             return
 
+        if not isinstance(auth_method, str):
+            raise OAuthError("Unsupported token_endpoint_auth_method - must be a string")
+
         if auth_method not in SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS:
-            raise OAuthError(f"Unsupported token_endpoint_auth_method '{sanitize_for_log(auth_method)}'. Supported values: {', '.join(sorted(SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS))}")
+            raise OAuthError("Unsupported token_endpoint_auth_method. Supported values: {', '.join(sorted(SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS))}")
 
         # Default: client_secret_post with a shared secret (RFC 6749 Section 2.3.1).
         if client_id:
@@ -693,6 +730,7 @@ class OAuthManager:
 
         # Fetch token with retries
         for attempt in range(self.max_retries):
+            await self._refresh_client_assertion(token_data, runtime_credentials)
             try:
                 response = await self._post_token_request(token_url, token_data, ca_certificate=ca_certificate, client_cert=client_cert, client_key=client_key, headers=headers)
                 response.raise_for_status()
@@ -756,6 +794,7 @@ class OAuthManager:
 
         # Fetch token with retries
         for attempt in range(self.max_retries):
+            await self._refresh_client_assertion(token_data, runtime_credentials)
             try:
                 response = await self._post_token_request(token_url, token_data, ca_certificate=ca_certificate, client_cert=client_cert, client_key=client_key, headers=headers)
                 response.raise_for_status()
@@ -831,6 +870,7 @@ class OAuthManager:
 
         # Exchange code for token with retries
         for attempt in range(self.max_retries):
+            await self._refresh_client_assertion(token_data, runtime_credentials)
             try:
                 client = await self._get_client()
                 response = await client.post(token_url, data=token_data, headers=headers, timeout=self.request_timeout, follow_redirects=False)
@@ -959,6 +999,7 @@ class OAuthManager:
         await self._apply_token_endpoint_auth(token_data, headers, runtime_credentials, require_client_id=False)
 
         for attempt in range(self.max_retries):
+            await self._refresh_client_assertion(token_data, runtime_credentials)
             try:
                 response = await self._post_token_request(
                     runtime_credentials["token_url"],
@@ -1914,6 +1955,7 @@ class OAuthManager:
 
         # Exchange code for token with retries
         for attempt in range(self.max_retries):
+            await self._refresh_client_assertion(token_data, runtime_credentials)
             try:
                 response = await self._post_token_request(token_url, token_data, ca_certificate=ca_certificate, client_cert=client_cert, client_key=client_key, headers=headers)
                 response.raise_for_status()
@@ -2006,6 +2048,7 @@ class OAuthManager:
 
         # Attempt token refresh with retries
         for attempt in range(self.max_retries):
+            await self._refresh_client_assertion(token_data, runtime_credentials)
             try:
                 response = await self._post_token_request(token_url, token_data, ca_certificate=ca_certificate, client_cert=client_cert, client_key=client_key, headers=headers)
                 if response.status_code == 200:

@@ -2425,7 +2425,16 @@ class TestGatewayEndpoints:
 
     @patch("mcpgateway.main.gateway_service.register_gateway")
     def test_create_gateway_accepts_private_key_jwt_config(self, mock_create, test_client, auth_headers):
-        """Valid private_key_jwt config passes schema validation and reaches the service."""
+        """Schema layer accepts a private_key_jwt config and forwards it to the service.
+
+        The private key here is opaque placeholder text, not real PEM. This asserts
+        only that the schema's string/presence/type checks pass and that the parsed
+        fields reach the service; ``register_gateway`` is mocked, so no key parsing
+        happens. Deep PEM validation is covered in
+        ``test_gateway_private_key_jwt_validation.py``, and
+        ``test_create_gateway_rejects_malformed_private_key`` asserts the unmocked
+        rejection path.
+        """
         mock_create.return_value = MOCK_GATEWAY_READ
         req = {
             "name": "test_gateway",
@@ -2445,6 +2454,29 @@ class TestGatewayEndpoints:
         assert parsed.oauth_config["token_endpoint_auth_method"] == "private_key_jwt"
         assert parsed.oauth_config["token_endpoint_auth_signing_alg"] == "ES256"
         assert parsed.oauth_config["private_key_jwt_kid"] == "kid-1"
+
+    def test_create_gateway_rejects_malformed_private_key(self, test_client, auth_headers):
+        """POST /gateways returns 400 for a private_key that is not parseable PEM.
+
+        Deliberately does not mock ``register_gateway``: the service-layer validator
+        is the only layer that can tell raw PEM from a masked placeholder or stored
+        ciphertext, so the rejection must be exercised through it. Pinning 400 here
+        keeps a later refactor from quietly turning this into a 500.
+        """
+        req = {
+            "name": "malformed_pk_gateway",
+            "url": "http://example.com",
+            "oauth_config": {
+                "client_id": "client-1",
+                "token_url": "https://issuer.example.com/token",
+                "token_endpoint_auth_method": "private_key_jwt",
+                "private_key": "dummy-private-key-material",  # pragma: allowlist secret
+            },
+        }
+        response = test_client.post("/gateways/", json=req, headers=auth_headers)
+        assert response.status_code == 400
+        # The handler returns a generic message; the key must never be echoed back.
+        assert "dummy-private-key-material" not in response.text
 
     @pytest.mark.parametrize(
         "oauth_config",

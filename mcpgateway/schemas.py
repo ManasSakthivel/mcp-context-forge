@@ -143,12 +143,18 @@ def _validate_oauth_token_endpoint_auth(v: Dict[str, Any]) -> None:
         ValueError: If the method, algorithm, key ID, or signing key is invalid.
     """
     raw_method = v.get("token_endpoint_auth_method")
-    if raw_method is not None and raw_method not in SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS:
-        raise ValueError(f"oauth_config.token_endpoint_auth_method '{raw_method}' is not supported. Supported values: {', '.join(sorted(SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS))}")
+    if raw_method is not None:
+        if not isinstance(raw_method, str):
+            raise ValueError("oauth_config.token_endpoint_auth_method must be a string")
+        if raw_method not in SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS:
+            raise ValueError(f"oauth_config.token_endpoint_auth_method is not supported. Supported values: {', '.join(sorted(SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS))}")
 
     raw_alg = v.get("token_endpoint_auth_signing_alg")
-    if raw_alg is not None and raw_alg not in SUPPORTED_TOKEN_ENDPOINT_SIGNING_ALGS:
-        raise ValueError(f"oauth_config.token_endpoint_auth_signing_alg '{raw_alg}' is not allowed. Supported values: {', '.join(sorted(SUPPORTED_TOKEN_ENDPOINT_SIGNING_ALGS))}")
+    if raw_alg is not None:
+        if not isinstance(raw_alg, str):
+            raise ValueError("oauth_config.token_endpoint_auth_signing_alg must be a string")
+        if raw_alg not in SUPPORTED_TOKEN_ENDPOINT_SIGNING_ALGS:
+            raise ValueError(f"oauth_config.token_endpoint_auth_signing_alg is not allowed. Supported values: {', '.join(sorted(SUPPORTED_TOKEN_ENDPOINT_SIGNING_ALGS))}")
 
     raw_kid = v.get("private_key_jwt_kid")
     if raw_kid is not None and raw_kid != "":

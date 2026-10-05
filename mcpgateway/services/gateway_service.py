@@ -83,6 +83,7 @@ except ImportError:
 
 # First-Party
 from mcpgateway import __version__
+from mcpgateway.common.oauth import validate_private_key_material
 from mcpgateway.common.validators import SecurityValidator
 from mcpgateway.config import settings
 from mcpgateway.db import EmailTeam as DbEmailTeam
@@ -919,6 +920,59 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
         return oauth_config
 
     @staticmethod
+    def _validate_private_key_jwt_config(oauth_config: Optional[dict]) -> None:
+        """Validate ``private_key_jwt`` key material before persistence. No-op for other methods.
+
+        Runs here rather than in the Pydantic schema because only this layer can tell
+        the three inbound shapes apart: a masked placeholder (an update that keeps the
+        stored key), stored ciphertext (likewise), and raw PEM (the only shape worth
+        parsing). A schema validator cannot reach the encryption service, so a second
+        check there would need a weaker heuristic and could disagree with this one.
+
+        ``is_encrypted()`` gates "skip parsing" only. Its docstring warns against
+        security decisions, and that warning holds: a false positive means the value
+        is stored unparsed. That is already the behavior of
+        ``_encrypt_oauth_secret_value``, which trusts the same heuristic immediately
+        after this runs, so the two agree rather than drift.
+
+        Args:
+            oauth_config: Raw gateway oauth_config dict being applied (create or update).
+
+        Raises:
+            ValueError: If ``token_endpoint_auth_method`` is ``private_key_jwt`` and the
+                supplied private key is missing, malformed, passphrase-protected, or
+                mismatched with ``token_endpoint_auth_signing_alg``. ``register_gateway``
+                re-raises it, so creates return HTTP 400; ``update_gateway`` wraps it in
+                ``GatewayError``, exactly as it already does for
+                ``_validate_token_exchange_config``'s rejections.
+        """
+        if not oauth_config:
+            return
+
+        method = oauth_config.get("token_endpoint_auth_method")
+        # Matches how the signing path reads this field (OAuthManager strips but does
+        # not lowercase), so a config this gate skips cannot be one the runtime then
+        # signs with private_key_jwt. Casing is the schema's job: it rejects anything
+        # outside SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS case-sensitively.
+        if not isinstance(method, str) or method.strip() != "private_key_jwt":
+            return
+
+        private_key = oauth_config.get("private_key")
+        if not isinstance(private_key, str) or not private_key.strip():
+            raise ValueError("oauth_config.private_key is required when token_endpoint_auth_method is private_key_jwt")
+
+        # An update may legitimately resubmit the masked placeholder or the stored
+        # ciphertext to mean "keep the existing key". Neither is PEM, and parsing
+        # ciphertext as PEM would reject every stored key.
+        if private_key == settings.masked_auth_value:
+            return
+        if get_encryption_service(settings.auth_encryption_secret).is_encrypted(private_key):
+            return
+
+        signing_alg = oauth_config.get("token_endpoint_auth_signing_alg")
+        validate_private_key_material(private_key, signing_alg if isinstance(signing_alg, str) else None)
+
+    @staticmethod
     async def _enforce_token_exchange_admin_only(db: Session, oauth_config: Optional[dict], requester_email: Optional[str]) -> None:
         """Restrict creating/modifying a token-exchange gateway to platform admins.
 
@@ -980,6 +1034,7 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
         await self._enforce_token_exchange_admin_only(db, raw_oauth_config, requester_email)
         raw_oauth_config = await self._auto_discover_oauth_endpoints(raw_oauth_config)
         raw_oauth_config = self._validate_token_exchange_config(raw_oauth_config)
+        self._validate_private_key_jwt_config(raw_oauth_config)
         return await protect_oauth_config_for_storage(raw_oauth_config)
 
     @staticmethod
@@ -3066,6 +3121,7 @@ class GatewayService(BaseService):  # pylint: disable=too-many-instance-attribut
                     await self._enforce_token_exchange_admin_only(db, raw_oauth_update, user_email)
                     raw_oauth_update = await self._auto_discover_oauth_endpoints(raw_oauth_update)
                     raw_oauth_update = self._validate_token_exchange_config(raw_oauth_update)
+                    self._validate_private_key_jwt_config(raw_oauth_update)
                     gateway.oauth_config = await protect_oauth_config_for_storage(raw_oauth_update, existing_oauth_config=gateway.oauth_config)
 
                 # Handle auth_value updates (both existing and new auth values)
