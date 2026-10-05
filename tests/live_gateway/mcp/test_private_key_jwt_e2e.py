@@ -426,6 +426,26 @@ async def hub_client():
 # ---------------------------------------------------------------------------
 # Assertion helpers
 # ---------------------------------------------------------------------------
+def _gateway_named(admin_api: httpx.Client, name: str) -> bool:
+    """Return whether a gateway with *name* exists.
+
+    A rejected registration must leave nothing behind. Asserting on the status
+    code alone would pass even if the row had been created and the error raised
+    afterwards.
+
+    Args:
+        admin_api: Authenticated admin HTTP client.
+        name: Gateway name to look for.
+
+    Returns:
+        bool: True when a gateway with that name is listed.
+    """
+    resp = admin_api.get("/gateways")
+    if resp.status_code != 200:
+        raise AssertionError(f"could not list gateways to confirm rollback: {resp.status_code} {resp.text}")
+    return any(gateway.get("name") == name for gateway in resp.json())
+
+
 def _verify_assertion(stub_stack: dict[str, Any], token_request: OrderedDict[str, Any]) -> None:
     """Decode and verify the client assertion the gateway sent, asserting RFC 7523 claims."""
     assert token_request.get("grant_type") == "client_credentials"
@@ -496,7 +516,11 @@ class TestPrivateKeyJwtLiveFlow:
         assert "BEGIN PRIVATE KEY" not in body and "BEGIN RSA PRIVATE KEY" not in body, "private_key leaked through API"  # pragma: allowlist secret
 
     def test_invalid_method_rejected_with_422(self, admin_api: httpx.Client) -> None:
-        """An unsupported token_endpoint_auth_method fails closed at the live API boundary."""
+        """An unsupported token_endpoint_auth_method fails closed at the live API boundary.
+
+        Also asserts the gateway was not created. A 422 alone does not prove
+        nothing persisted, and a partially-created row would be the real damage.
+        """
         name = f"pkce-e2e-invalid-{uuid.uuid4().hex[:8]}"
         payload = {
             "name": name,
@@ -512,10 +536,17 @@ class TestPrivateKeyJwtLiveFlow:
         }
         resp = admin_api.post("/gateways", json=payload)
         assert resp.status_code == 422, f"expected 422 for unsupported method, got {resp.status_code} {resp.text}"
+        assert not _gateway_named(admin_api, name), "a rejected config must not leave a gateway row behind"
 
     def test_hs256_signing_alg_rejected_with_422(self, admin_api: httpx.Client) -> None:
-        """An HMAC signing algorithm for assertions fails closed at the live API boundary."""
+        """An HMAC signing algorithm for assertions fails closed at the live API boundary.
+
+        HS* would let a shared secret masquerade as a signed assertion, so this
+        rejection is the downgrade guard. Asserts the submitted key material is
+        absent from the error body and that no gateway row was created.
+        """
         name = f"pkce-e2e-invalid-alg-{uuid.uuid4().hex[:8]}"
+        sentinel = "SENTINEL-HS256-KEY-MATERIAL"
         payload = {
             "name": name,
             "url": "https://mcp.example.com/mcp",
@@ -527,11 +558,13 @@ class TestPrivateKeyJwtLiveFlow:
                 "token_url": "https://idp.example.com/token",
                 "token_endpoint_auth_method": "private_key_jwt",
                 "token_endpoint_auth_signing_alg": "HS256",
-                "private_key": "not-a-real-key",  # pragma: allowlist secret - fixture literal
+                "private_key": sentinel,  # pragma: allowlist secret - fixture literal
             },
         }
         resp = admin_api.post("/gateways", json=payload)
         assert resp.status_code == 422, f"expected 422 for HS256, got {resp.status_code} {resp.text}"
+        assert sentinel not in resp.text, "the rejection echoed the submitted key material"
+        assert not _gateway_named(admin_api, name), "a rejected config must not leave a gateway row behind"
 
     def test_unauthenticated_registration_is_rejected(self) -> None:
         """An unauthenticated caller cannot register a private_key_jwt gateway.
