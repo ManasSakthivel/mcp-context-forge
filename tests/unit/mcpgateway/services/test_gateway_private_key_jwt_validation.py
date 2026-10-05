@@ -204,6 +204,13 @@ class TestGatewayServicePrivateKeyJwtGate:
         # Exhaustive check of the one property that matters for this gate: there is
         # no spelling of token_endpoint_auth_method that the signing path treats as
         # private_key_jwt while this gate skips validation.
+        #
+        # The predicate below mirrors OAuthManager's normalization at
+        # oauth_manager.py:640-641 (strip(), deliberately no lower()). It is a
+        # restatement, not a read, so changing that normalization requires
+        # changing this line in the same commit; otherwise this test keeps passing
+        # while the skip-gap reopens. It still catches the likelier regression,
+        # which is someone editing the gate in gateway_service.py.
         for method in ("private_key_jwt", "  private_key_jwt  ", "PRIVATE_KEY_JWT", "Private_Key_Jwt", "client_secret_post", "none", ""):
             runtime_signs_with_pkjwt = method.strip() == "private_key_jwt"
             if not runtime_signs_with_pkjwt:
