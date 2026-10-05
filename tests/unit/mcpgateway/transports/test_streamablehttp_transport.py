@@ -33,6 +33,9 @@ from cpex.framework import PluginViolationError
 from cpex.framework.models import PluginViolation
 from fastapi import HTTPException
 import httpx
+import httpx2
+from mcp import Client
+from mcp.client.streamable_http import streamable_http_client
 from mcp_types import PromptArgument
 import mcp_types as types
 from mcp.shared.exceptions import MCPError
@@ -9242,6 +9245,7 @@ async def test_forwarded_non_post_returns_200(monkeypatch):
             raise AssertionError("Should not reach SDK")
 
     monkeypatch.setattr(tr, "StreamableHTTPSessionManager", lambda **kwargs: DummySessionManager())
+    monkeypatch.setattr(tr.settings, "mcpgateway_session_affinity_enabled", True)
     wrapper = SessionManagerWrapper()
     await wrapper.initialize()
 
@@ -9268,6 +9272,7 @@ async def test_forwarded_post_routes_to_rpc(monkeypatch):
             raise AssertionError("Should not reach SDK")
 
     monkeypatch.setattr(tr, "StreamableHTTPSessionManager", lambda **kwargs: DummySessionManager())
+    monkeypatch.setattr(tr.settings, "mcpgateway_session_affinity_enabled", True)
     wrapper = SessionManagerWrapper()
     await wrapper.initialize()
 
@@ -9312,6 +9317,7 @@ async def test_forwarded_post_routes_to_rpc_multipart_body_and_auth_header(monke
             raise AssertionError("Should not reach SDK")
 
     monkeypatch.setattr(tr, "StreamableHTTPSessionManager", lambda **kwargs: DummySessionManager())
+    monkeypatch.setattr(tr.settings, "mcpgateway_session_affinity_enabled", True)
     wrapper = SessionManagerWrapper()
     await wrapper.initialize()
 
@@ -9368,6 +9374,7 @@ async def test_forwarded_post_empty_body_returns_202(monkeypatch):
             raise AssertionError("Should not reach SDK")
 
     monkeypatch.setattr(tr, "StreamableHTTPSessionManager", lambda **kwargs: DummySessionManager())
+    monkeypatch.setattr(tr.settings, "mcpgateway_session_affinity_enabled", True)
     wrapper = SessionManagerWrapper()
     await wrapper.initialize()
 
@@ -9392,6 +9399,7 @@ async def test_forwarded_post_notification_returns_202(monkeypatch):
             raise AssertionError("Should not reach SDK")
 
     monkeypatch.setattr(tr, "StreamableHTTPSessionManager", lambda **kwargs: DummySessionManager())
+    monkeypatch.setattr(tr.settings, "mcpgateway_session_affinity_enabled", True)
     wrapper = SessionManagerWrapper()
     await wrapper.initialize()
 
@@ -9417,6 +9425,7 @@ async def test_forwarded_post_disconnect_returns_early(monkeypatch):
             raise AssertionError("Should not reach SDK")
 
     monkeypatch.setattr(tr, "StreamableHTTPSessionManager", lambda **kwargs: DummySessionManager())
+    monkeypatch.setattr(tr.settings, "mcpgateway_session_affinity_enabled", True)
     wrapper = SessionManagerWrapper()
     await wrapper.initialize()
 
@@ -9446,6 +9455,7 @@ async def test_forwarded_post_exception_falls_through(monkeypatch):
             await send_func({"type": "http.response.body", "body": b"sdk"})
 
     monkeypatch.setattr(tr, "StreamableHTTPSessionManager", lambda **kwargs: DummySessionManager())
+    monkeypatch.setattr(tr.settings, "mcpgateway_session_affinity_enabled", True)
     wrapper = SessionManagerWrapper()
     await wrapper.initialize()
 
@@ -9486,6 +9496,7 @@ async def test_forwarded_post_injects_server_id_from_url(monkeypatch):
 
     monkeypatch.setattr(tr, "StreamableHTTPSessionManager", lambda **kwargs: DummySessionManager())
     monkeypatch.setattr("mcpgateway.services.server_service.ServerService.entity_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(tr.settings, "mcpgateway_session_affinity_enabled", True)
     wrapper = SessionManagerWrapper()
     await wrapper.initialize()
 
@@ -9544,6 +9555,7 @@ async def test_forwarded_post_injects_server_id_with_existing_params(monkeypatch
 
     monkeypatch.setattr(tr, "StreamableHTTPSessionManager", lambda **kwargs: DummySessionManager())
     monkeypatch.setattr("mcpgateway.services.server_service.ServerService.entity_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(tr.settings, "mcpgateway_session_affinity_enabled", True)
     wrapper = SessionManagerWrapper()
     await wrapper.initialize()
 
@@ -9609,6 +9621,7 @@ async def test_forwarded_post_injects_server_id_with_non_dict_params(monkeypatch
 
     monkeypatch.setattr(tr, "StreamableHTTPSessionManager", lambda **kwargs: DummySessionManager())
     monkeypatch.setattr("mcpgateway.services.server_service.ServerService.entity_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(tr.settings, "mcpgateway_session_affinity_enabled", True)
     wrapper = SessionManagerWrapper()
     await wrapper.initialize()
 
@@ -9664,6 +9677,7 @@ async def test_forwarded_post_no_server_id_in_url_no_injection(monkeypatch):
             raise AssertionError("Should not reach SDK")
 
     monkeypatch.setattr(tr, "StreamableHTTPSessionManager", lambda **kwargs: DummySessionManager())
+    monkeypatch.setattr(tr.settings, "mcpgateway_session_affinity_enabled", True)
     wrapper = SessionManagerWrapper()
     await wrapper.initialize()
 
@@ -9715,6 +9729,7 @@ async def test_forwarded_post_denies_non_owner_session_access(monkeypatch):
 
     monkeypatch.setattr(tr, "StreamableHTTPSessionManager", lambda **kwargs: DummySessionManager())
     monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport._validate_streamable_session_access", AsyncMock(return_value=(False, 403, "Session access denied")))
+    monkeypatch.setattr(tr.settings, "mcpgateway_session_affinity_enabled", True)
 
     wrapper = SessionManagerWrapper()
     await wrapper.initialize()
@@ -9756,6 +9771,7 @@ async def test_forwarded_post_notification_no_server_id_injection(monkeypatch):
 
     monkeypatch.setattr(tr, "StreamableHTTPSessionManager", lambda **kwargs: DummySessionManager())
     monkeypatch.setattr("mcpgateway.services.server_service.ServerService.entity_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(tr.settings, "mcpgateway_session_affinity_enabled", True)
     wrapper = SessionManagerWrapper()
     await wrapper.initialize()
 
@@ -9799,6 +9815,7 @@ async def test_local_affinity_post_injects_server_id_regression(monkeypatch):
     monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.settings.use_stateful_sessions", True)
 
     monkeypatch.setattr("mcpgateway.services.server_service.ServerService.entity_exists", AsyncMock(return_value=True))
+    monkeypatch.setattr(tr.settings, "mcpgateway_session_affinity_enabled", True)
     wrapper = SessionManagerWrapper()
     await wrapper.initialize()
 
@@ -9820,7 +9837,7 @@ async def test_local_affinity_post_injects_server_id_regression(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
         patch("mcpgateway.transports.streamablehttp_transport.httpx.AsyncClient") as mock_client_cls,
     ):
@@ -9893,7 +9910,7 @@ async def test_local_affinity_post_dispatches_to_internal_endpoint_with_auth_con
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
         patch("mcpgateway.transports.streamablehttp_transport.httpx.AsyncClient") as mock_client_cls,
     ):
@@ -9962,7 +9979,7 @@ async def test_local_affinity_post_preserves_custom_auth_header(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
         patch("mcpgateway.transports.streamablehttp_transport.httpx.AsyncClient") as mock_client_cls,
     ):
@@ -10032,7 +10049,7 @@ async def test_local_affinity_post_injects_server_id_with_non_dict_params(monkey
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
         patch("mcpgateway.transports.streamablehttp_transport.httpx.AsyncClient") as mock_client_cls,
     ):
@@ -10096,7 +10113,7 @@ async def test_affinity_forward_to_owner_worker(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
     ):
         await wrapper.handle_streamable_http(scope, _make_receive(b'{"jsonrpc":"2.0"}'), send)
@@ -10152,7 +10169,7 @@ async def test_affinity_forward_to_owner_worker_multipart_body(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
     ):
         await wrapper.handle_streamable_http(scope, receive, send)
@@ -10211,7 +10228,7 @@ async def test_affinity_forward_to_owner_propagates_encoded_auth_context(monkeyp
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
     ):
         await wrapper.handle_streamable_http(scope, _make_receive(b'{"jsonrpc":"2.0"}'), send)
@@ -10257,7 +10274,7 @@ async def test_affinity_forward_failure_falls_through(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
     ):
         await wrapper.handle_streamable_http(scope, _make_receive(b'{"jsonrpc":"2.0"}'), send)
@@ -10296,7 +10313,7 @@ async def test_affinity_disconnect_during_body_read(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
     ):
         await wrapper.handle_streamable_http(scope, _make_receive_disconnect(), send)
@@ -10381,7 +10398,7 @@ async def test_local_affinity_post_routes_to_rpc(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
         patch("mcpgateway.transports.streamablehttp_transport.httpx.AsyncClient") as mock_client_cls,
     ):
@@ -10490,7 +10507,7 @@ async def test_local_affinity_post_denies_non_owner_session_access(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
         patch("mcpgateway.transports.streamablehttp_transport.httpx.AsyncClient") as mock_client_cls,
     ):
@@ -10559,7 +10576,7 @@ async def test_local_affinity_post_routes_to_rpc_multipart_and_auth_header(monke
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
         patch("mcpgateway.transports.streamablehttp_transport.httpx.AsyncClient") as mock_client_cls,
     ):
@@ -10606,7 +10623,7 @@ async def test_local_affinity_disconnect_during_body_read(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
     ):
         await wrapper.handle_streamable_http(scope, _make_receive_disconnect(), send)
@@ -10645,7 +10662,7 @@ async def test_local_affinity_post_empty_body_returns_202(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
     ):
         await wrapper.handle_streamable_http(scope, _make_receive(b""), send)
@@ -10685,7 +10702,7 @@ async def test_local_affinity_post_notification_returns_202(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
     ):
         await wrapper.handle_streamable_http(scope, _make_receive(body), send)
@@ -10730,7 +10747,7 @@ async def test_local_affinity_post_exception_falls_through(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
         patch("mcpgateway.transports.streamablehttp_transport.httpx.AsyncClient") as mock_client_cls,
     ):
@@ -10866,7 +10883,7 @@ async def test_send_with_capture_registers_session(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
     ):
         await wrapper.handle_streamable_http(scope, _make_receive(b""), send)
 
@@ -10909,7 +10926,7 @@ async def test_send_with_capture_str_headers_and_non_matching_header(monkeypatch
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
     ):
         await wrapper.handle_streamable_http(scope, _make_receive(b""), send)
 
@@ -10951,7 +10968,7 @@ async def test_send_with_capture_registration_failure_logged(monkeypatch, caplog
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         caplog.at_level("WARNING", logger="mcpgateway.transports.streamablehttp_transport"),
     ):
         await wrapper.handle_streamable_http(scope, _make_receive(b""), send)
@@ -10989,7 +11006,7 @@ async def test_send_with_capture_no_session_id_no_registration(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
     ):
         await wrapper.handle_streamable_http(scope, _make_receive(b""), send)
 
@@ -11031,7 +11048,7 @@ async def test_send_with_capture_claims_owner_for_new_session(monkeypatch):
     mock_pool.register_session_owner = AsyncMock()
 
     with patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool):
-        with patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"):
+        with patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"):
             token = tr.user_context_var.set(
                 {
                     "email": "dev@example.com",
@@ -11125,7 +11142,7 @@ async def test_send_with_capture_does_not_register_denied_client_supplied_sessio
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"),
         patch("mcpgateway.services.session_affinity.SessionAffinity") as mock_session_class,
     ):
         mock_session_class.is_valid_mcp_session_id = MagicMock(return_value=True)
@@ -13424,7 +13441,7 @@ async def test_local_affinity_post_injects_server_id(monkeypatch):
     mock_response.content = b"{}"
 
     with patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool):
-        with patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"):
+        with patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"):
             with patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class):
                 with patch("mcpgateway.transports.streamablehttp_transport.httpx.AsyncClient") as mock_client_cls:
                     mock_client = AsyncMock()
@@ -14534,7 +14551,7 @@ async def test_local_affinity_post_injects_server_id_when_params_missing(monkeyp
     mock_response.content = b"{}"
 
     with patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool):
-        with patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"):
+        with patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"):
             with patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class):
                 with patch("mcpgateway.transports.streamablehttp_transport.httpx.AsyncClient") as mock_client_cls:
                     mock_client = AsyncMock()
@@ -14597,7 +14614,7 @@ async def test_local_affinity_post_no_injection_without_server_url(monkeypatch):
     mock_response.content = b"{}"
 
     with patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool):
-        with patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"):
+        with patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"):
             with patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class):
                 with patch("mcpgateway.transports.streamablehttp_transport.httpx.AsyncClient") as mock_client_cls:
                     mock_client = AsyncMock()
@@ -15875,7 +15892,7 @@ async def test_session_owner_mismatch_logs_warning(monkeypatch, caplog):
     mock_pool.register_session_owner = AsyncMock()
 
     with patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool):
-        with patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-1"):
+        with patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-1"):
             token = tr.user_context_var.set(
                 {
                     "email": "requester@example.com",
@@ -19115,6 +19132,74 @@ class TestDualEra:
         assert tr._is_known_mcp_request_method("server/discover")
 
 
+_X_MCP_HEADER_SCHEMA = {"type": "object", "properties": {"region": {"type": "string", "x-mcp-header": "Region"}}}
+
+
+class TestXMcpHeaderServing:
+    """The gateway as a server enforces x-mcp-header annotations on modern tools/call requests."""
+
+    @staticmethod
+    def _serve_annotated_tool(monkeypatch) -> AsyncMock:
+        """Publish one annotated tool through the gateway's catalog and return the patched invoke_tool."""
+        tool = MagicMock()
+        tool.name = "routed"
+        tool.title = None
+        tool.description = "routes by region"
+        tool.input_schema = _X_MCP_HEADER_SCHEMA
+        tool.output_schema = None
+        tool.annotations = {}
+
+        @asynccontextmanager
+        async def fake_get_db():
+            yield MagicMock()
+
+        monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport.get_db", fake_get_db)
+        # mcp 2.2 attaches the HTTP request to the handler context, so the catalog handlers would
+        # authenticate it; supply the default (no server, no headers, anonymous) context instead.
+        monkeypatch.setattr("mcpgateway.transports.streamablehttp_transport._get_request_context_or_default", AsyncMock(return_value=(None, {}, {})))
+        monkeypatch.setattr(tool_service, "list_tools", AsyncMock(return_value=([tool], None)))
+        invoke = AsyncMock(return_value=types.CallToolResult(content=[types.TextContent(type="text", text="ok")], is_error=False))
+        monkeypatch.setattr(tool_service, "invoke_tool", invoke)
+        return invoke
+
+    @staticmethod
+    @asynccontextmanager
+    async def _modern_client(extra_headers: dict[str, str]):
+        """A 2026-07-28 SDK client talking in-process to the session manager the gateway wraps."""
+        manager = tr.StreamableHTTPSessionManager(app=tr.mcp_app, stateless=True, json_response=True)
+        token = server_id_var.set(None)
+        try:
+            async with manager.run():
+                async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=manager.handle_request), base_url="http://gateway", headers=extra_headers) as http:
+                    async with Client(streamable_http_client("http://gateway/mcp", http_client=http), mode="2026-07-28") as client:
+                        yield client
+        finally:
+            server_id_var.reset(token)
+
+    @pytest.mark.asyncio
+    async def test_mcp_param_header_disagreeing_with_the_body_is_rejected_before_dispatch(self, monkeypatch):
+        invoke = self._serve_annotated_tool(monkeypatch)
+        async with self._modern_client({"Mcp-Param-Region": "us"}) as client:
+            with pytest.raises(MCPError) as mismatch:
+                await client.call_tool("routed", {"region": "eu"})
+            with pytest.raises(MCPError) as absent:
+                await client.call_tool("routed", {})
+        assert mismatch.value.error.code == -32020
+        assert mismatch.value.error.message == "Mcp-Param-Region header does not match the request body's 'region' argument"
+        assert absent.value.error.code == -32020
+        assert absent.value.error.message == "Mcp-Param-Region header is present but the request body's 'region' argument is absent"
+        invoke.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_client_that_listed_the_tool_mirrors_the_header_and_reaches_it(self, monkeypatch):
+        invoke = self._serve_annotated_tool(monkeypatch)
+        async with self._modern_client({}) as client:
+            await client.list_tools()
+            result = await client.call_tool("routed", {"region": "eu"})
+        assert result.is_error is False
+        assert invoke.await_args.kwargs["arguments"] == {"region": "eu"}
+
+
 class TestUnknownEntityErrors:
     """Not-found answers for tools/prompts/resources: native shapes, never SDK catch-all defaults."""
 
@@ -19697,7 +19782,7 @@ async def test_affinity_span_attributes_owner_is_local_worker(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-abc"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-abc"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
     ):
         await wrapper.handle_streamable_http(scope, _make_receive(b""), send)
@@ -19762,7 +19847,7 @@ async def test_affinity_span_attributes_owner_is_different_worker(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "this-worker"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="this-worker"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
         patch("mcpgateway.transports.streamablehttp_transport.httpx.AsyncClient") as mock_client_cls,
     ):
@@ -19827,7 +19912,7 @@ async def test_affinity_span_attributes_no_owner(monkeypatch):
 
     with (
         patch("mcpgateway.services.session_affinity.get_session_affinity", return_value=mock_pool),
-        patch("mcpgateway.services.session_affinity.WORKER_ID", "worker-xyz"),
+        patch("mcpgateway.services.session_affinity.get_worker_id", return_value="worker-xyz"),
         patch("mcpgateway.services.session_affinity.SessionAffinity", mock_session_class),
     ):
         await wrapper.handle_streamable_http(scope, _make_receive(b""), send)

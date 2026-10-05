@@ -29,7 +29,7 @@ from sqlalchemy.exc import IntegrityError
 
 # First-Party
 from mcpgateway.cache.global_config_cache import global_config_cache
-from mcpgateway.cache.tool_lookup_cache import tool_lookup_cache
+from mcpgateway.cache.tool_lookup_cache import ToolLookupCache, tool_lookup_cache
 from mcpgateway.common.validators import pin_url_to_resolved_ip
 from mcpgateway.config import settings
 from mcpgateway.db import Gateway as DbGateway
@@ -2045,6 +2045,43 @@ class TestToolService:
         assert "statement" in str(exc_info.value)
 
     @pytest.mark.asyncio
+    async def test_update_gateway_tool_custom_name_checks_final_invocation_name(self, tool_service, mock_tool, test_db, monkeypatch):
+        """Gateway-backed custom-name updates reject collisions with full local invocation names."""
+        mock_tool.gateway.name = "prod"
+        conflicting_tool = MagicMock(spec=DbTool)
+        conflicting_tool.id = "2"
+        conflicting_tool.name = "prod-search"
+        conflicting_tool.enabled = True
+        conflicting_tool.visibility = "public"
+        monkeypatch.setattr("mcpgateway.services.tool_service.get_for_update", Mock(side_effect=[mock_tool, conflicting_tool]))
+        tool_service._server_ids_for_tool_cache_invalidation = Mock(return_value=())
+        test_db.rollback = Mock()
+
+        with pytest.raises(ToolNameConflictError):
+            await tool_service.update_tool(test_db, "1", ToolUpdate(custom_name="search"))
+
+        test_db.rollback.assert_called_once()
+        assert mock_tool.custom_name == "test_tool"
+
+    @pytest.mark.asyncio
+    async def test_update_gateway_tool_visibility_checks_final_invocation_name(self, tool_service, mock_tool, test_db, monkeypatch):
+        """Gateway-backed visibility updates validate full invocation name in target scope."""
+        mock_tool.gateway.name = "prod"
+        conflicting_tool = MagicMock(spec=DbTool)
+        conflicting_tool.id = "2"
+        conflicting_tool.name = "prod-test-tool"
+        conflicting_tool.enabled = True
+        conflicting_tool.visibility = "team"
+        monkeypatch.setattr("mcpgateway.services.tool_service.get_for_update", Mock(side_effect=[mock_tool, conflicting_tool]))
+        tool_service._server_ids_for_tool_cache_invalidation = Mock(return_value=())
+        test_db.rollback = Mock()
+
+        with pytest.raises(ToolNameConflictError):
+            await tool_service.update_tool(test_db, "1", ToolUpdate(visibility="team"))
+
+        test_db.rollback.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_update_tool_not_found(self, tool_service, test_db):
         """Test updating a non-existent tool."""
         # Mock DB get to return None
@@ -2226,6 +2263,142 @@ class TestToolService:
         with pytest.raises(ToolInvocationError):
             await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
 
+    @pytest.mark.timeout(30)
+    @pytest.mark.asyncio
+    async def test_preview_tool_invocation_offloads_hostile_schema_validation(self, tool_service, mock_tool, mock_global_config_obj, test_db):
+        """A catastrophic input_schema must not stall the loop through the real entry point.
+
+        tests/security/test_schema_regex_redos.py proves the sandbox mechanism itself stays
+        bounded, but it wraps its own call in ``asyncio.to_thread`` and so never exercises
+        whether production actually offloads it. ``_resolve_tool_for_invocation`` -- shared by
+        ``invoke_tool`` and ``preview_tool_invocation`` -- calls the schema validator directly
+        from async code; without ``asyncio.to_thread`` there, this test stalls for the sandbox's
+        timeout budget instead of returning to the loop immediately. ``preview_tool_invocation``
+        is the entry point here because it resolves and validates without dispatching (#5629),
+        so no HTTP/MCP/jq mocking is needed to isolate the validation offload.
+        """
+        # First-Party
+        from mcpgateway.utils.safe_jsonschema import shutdown_validation_pool, start_validation_pool
+
+        # The subject length and the timeout phrase mirror tests/security/test_schema_regex_redos.py,
+        # which documents that reasoning.
+        #
+        # The loop-stall budget here is deliberately tighter than that sibling test's, because
+        # this test targets a different bug shape. That sibling test proves the sandbox worker
+        # itself is bounded; a thread-only non-fix there still stalls the loop for close to the
+        # sandbox's own timeout (~1s), so its budget only needs to rule out an *unbounded* stall
+        # (multiple seconds). This test proves the offload at the call site is actually present;
+        # a MISSING offload here also stalls for close to the sandbox timeout, not forever,
+        # because the sandbox still kills the runaway worker -- so a loose budget would pass on
+        # a genuinely broken call site. Measured directly: with the offload removed, the call
+        # blocks the loop for 1.01s (the sandbox's own regex_timeout_seconds); with it in place,
+        # 0.006s. Half of the timeout setting sits with wide margin on both sides of that gap.
+        bounded_phrase = "exceeded the execution time limit"
+        max_supported_regex_timeout_seconds = 1.0
+        min_heartbeats = 15
+
+        mock_tool.input_schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"q": {"type": "string", "pattern": "^(a+)+$"}},
+        }
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
+
+        start_validation_pool()
+        try:
+            lateness: list[float] = []
+            stop = asyncio.Event()
+
+            async def heartbeat() -> None:
+                """Wake every 10 ms and record how late each wake-up was."""
+                while not stop.is_set():
+                    start = time.perf_counter()
+                    await asyncio.sleep(0.01)
+                    lateness.append(time.perf_counter() - start - 0.01)
+
+            beat = asyncio.create_task(heartbeat())
+            await asyncio.sleep(0.2)
+            preview_result = await tool_service.preview_tool_invocation(test_db, "test_tool", {"q": "a" * 28 + "b"})
+            stop.set()
+            await beat
+        finally:
+            shutdown_validation_pool()
+
+        assert len(lateness) >= min_heartbeats, f"heartbeat produced {len(lateness)} samples; the loop assertion would be vacuous"
+
+        from mcpgateway.config import settings  # pylint: disable=import-outside-toplevel
+
+        assert settings.regex_timeout_seconds <= max_supported_regex_timeout_seconds, (
+            f"regex_timeout_seconds is {settings.regex_timeout_seconds}s, above {max_supported_regex_timeout_seconds}s; the loop budget below is derived from this setting and must not silently widen with it"
+        )
+        budget = 0.5 * settings.regex_timeout_seconds
+        assert max(lateness) < budget, f"event loop stalled {max(lateness):.2f}s; budget is {budget:.2f}s -- a missing offload stalls near the sandbox's own timeout, not forever, so this must stay tight"
+
+        assert preview_result.validated is False
+        assert any(w.code == "invalid_arguments" and bounded_phrase in w.message for w in preview_result.warnings), f"validation must be stopped by the budget, not by an unrelated refusal; got {preview_result.warnings!r}"
+
+    @pytest.mark.timeout(30)
+    @pytest.mark.asyncio
+    async def test_invoke_tool_offloads_hostile_output_schema_validation(self, tool_service, mock_tool, mock_global_config_obj, test_db):
+        """A catastrophic output_schema must not stall the loop through ``invoke_tool``.
+
+        The output path validates in ``_extract_and_validate_structured_content``, offloaded
+        with ``asyncio.to_thread`` at its call site. Removing that offload stalls the loop for
+        the sandbox timeout, so the budget is half of ``regex_timeout_seconds``, as in the
+        input-path test above.
+        """
+        # First-Party
+        from mcpgateway.config import settings
+        from mcpgateway.utils.safe_jsonschema import shutdown_validation_pool, start_validation_pool
+
+        min_heartbeats = 15
+        mock_tool.integration_type = "REST"
+        mock_tool.request_type = "GET"
+        mock_tool.jsonpath_filter = ""
+        mock_tool.auth_value = None
+        mock_tool.output_schema = {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"q": {"type": "string", "pattern": "^(a+)+$"}},
+        }
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
+
+        mock_response = AsyncMock()
+        mock_response.raise_for_status = Mock()
+        mock_response.status_code = 200
+        mock_response.json = Mock(return_value={"q": "a" * 28 + "b"})
+        tool_service._http_client.get = AsyncMock(return_value=mock_response)
+
+        start_validation_pool()
+        try:
+            lateness: list[float] = []
+            stop = asyncio.Event()
+
+            async def heartbeat() -> None:
+                """Wake every 10 ms and record how late each wake-up was."""
+                while not stop.is_set():
+                    start = time.perf_counter()
+                    await asyncio.sleep(0.01)
+                    lateness.append(time.perf_counter() - start - 0.01)
+
+            beat = asyncio.create_task(heartbeat())
+            await asyncio.sleep(0.2)
+            with patch("mcpgateway.services.tool_service.metrics_buffer", Mock()):
+                result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
+            stop.set()
+            await beat
+        finally:
+            shutdown_validation_pool()
+
+        assert len(lateness) >= min_heartbeats, f"heartbeat produced {len(lateness)} samples; the loop assertion would be vacuous"
+        max_supported_regex_timeout_seconds = 1.0
+        assert settings.regex_timeout_seconds <= max_supported_regex_timeout_seconds, (
+            f"regex_timeout_seconds is {settings.regex_timeout_seconds}s, above {max_supported_regex_timeout_seconds}s; the loop budget below is derived from this setting and must not silently widen with it"
+        )
+        budget = 0.5 * settings.regex_timeout_seconds
+        assert max(lateness) < budget, f"event loop stalled {max(lateness):.2f}s; budget is {budget:.2f}s"
+        assert result.is_error, "the hostile output must fail validation, not pass"
+
     @pytest.mark.asyncio
     async def test_invoke_tool_rest_get(self, tool_service, mock_tool, mock_global_config_obj, test_db):
         # ----------------  DB  -----------------
@@ -2290,7 +2463,9 @@ class TestToolService:
         mock_response = AsyncMock()
         mock_response.raise_for_status = Mock()  # HTTP response raise_for_status is synchronous
         mock_response.status_code = 205
-        mock_response.json = Mock(return_value=ToolResult(content=[TextContent(type="text", text="Tool error encountered")]))
+        # For error responses, json() should raise or return dict with "error" key
+        mock_response.text = "Tool error encountered"
+        mock_response.json = Mock(return_value={"error": "Tool error encountered"})
 
         tool_service._http_client.get = AsyncMock(return_value=mock_response)
 
@@ -2301,7 +2476,7 @@ class TestToolService:
             # -------------- invoke -----------------
             result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
 
-        assert result.content[0].text == "Tool error encountered"
+        assert "Tool error encountered" in result.content[0].text
 
     @pytest.mark.asyncio
     async def test_invoke_tool_rest_post(self, tool_service, mock_tool, mock_global_config_obj, test_db):
@@ -6659,6 +6834,75 @@ class TestRestToolNonJsonResponses:
             assert "Failed to parse JSON error response" in caplog.text
 
     @pytest.mark.asyncio
+    async def test_rest_tool_handles_json_error_with_error_key(self, tool_service, mock_tool, mock_global_config_obj, test_db):
+        """HTTP error response with JSON containing 'error' key."""
+        # Third-Party
+        import httpx
+
+        mock_tool.integration_type = "REST"
+        mock_tool.request_type = "GET"
+        mock_tool.jsonpath_filter = ""
+        mock_tool.auth_value = None
+
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
+
+        mock_response = AsyncMock()
+        mock_request = Mock(spec=httpx.Request)
+        mock_request.url = "https://api.example.com/test"
+        mock_response.raise_for_status = Mock(
+            side_effect=httpx.HTTPStatusError("Server Error", request=mock_request, response=mock_response)
+        )
+        mock_response.status_code = 500
+        mock_response.text = '{"error": "Internal server error", "code": "ERR_500"}'
+        mock_response.json = Mock(return_value={"error": "Internal server error", "code": "ERR_500"})
+
+        tool_service._http_client.get = AsyncMock(return_value=mock_response)
+
+        mock_metrics_buffer = Mock()
+        mock_metrics_buffer.record_tool_metric = Mock()
+        with patch("mcpgateway.services.tool_service.metrics_buffer", mock_metrics_buffer):
+            result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
+
+            assert result.is_error is True
+            # Error message should extract the "error" value
+            assert "Internal server error" in result.content[0].text
+
+    @pytest.mark.asyncio
+    async def test_rest_tool_handles_json_error_without_error_key(self, tool_service, mock_tool, mock_global_config_obj, test_db):
+        """HTTP error response with JSON but no 'error' key."""
+        # Third-Party
+        import httpx
+
+        mock_tool.integration_type = "REST"
+        mock_tool.request_type = "GET"
+        mock_tool.jsonpath_filter = ""
+        mock_tool.auth_value = None
+
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
+
+        mock_response = AsyncMock()
+        mock_request = Mock(spec=httpx.Request)
+        mock_request.url = "https://api.example.com/test"
+        mock_response.raise_for_status = Mock(
+            side_effect=httpx.HTTPStatusError("Not Found", request=mock_request, response=mock_response)
+        )
+        mock_response.status_code = 404
+        mock_response.text = '{"message": "Resource not found", "path": "/api/test"}'
+        mock_response.json = Mock(return_value={"message": "Resource not found", "path": "/api/test"})
+
+        tool_service._http_client.get = AsyncMock(return_value=mock_response)
+
+        mock_metrics_buffer = Mock()
+        mock_metrics_buffer.record_tool_metric = Mock()
+        with patch("mcpgateway.services.tool_service.metrics_buffer", mock_metrics_buffer):
+            result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
+
+            assert result.is_error is True
+            # Error message should use fallback format
+            assert "HTTP 404:" in result.content[0].text
+            assert "Resource not found" in result.content[0].text
+
+    @pytest.mark.asyncio
     async def test_rest_tool_handles_plain_text_response(self, tool_service, mock_tool, mock_global_config_obj, test_db, caplog):
         """REST tool handles plain text responses without crashing."""
         mock_tool.integration_type = "REST"
@@ -6686,6 +6930,8 @@ class TestRestToolNonJsonResponses:
 
             assert result.content[0].text is not None
             assert "Failed to parse JSON response" in caplog.text
+            # No outputSchema: plain text is still a successful result (#6199 only affects schema tools)
+            assert result.is_error is False
 
     @pytest.mark.asyncio
     async def test_rest_tool_handles_xml_response(self, tool_service, mock_tool, mock_global_config_obj, test_db, caplog):
@@ -6775,7 +7021,10 @@ class TestRestToolNonJsonResponses:
 
     @pytest.mark.asyncio
     async def test_rest_tool_truncates_large_response_text(self, tool_service, mock_tool, mock_global_config_obj, test_db, caplog):
-        """REST tool truncates response text exceeding REST_RESPONSE_TEXT_MAX_LENGTH."""
+        """REST tool truncates response text exceeding REST_RESPONSE_TEXT_MAX_LENGTH.
+
+        Without an outputSchema the truncated text is still returned as a successful result (#6199).
+        """
         mock_tool.integration_type = "REST"
         mock_tool.request_type = "GET"
         mock_tool.jsonpath_filter = ""
@@ -6800,15 +7049,17 @@ class TestRestToolNonJsonResponses:
         with patch("mcpgateway.services.tool_service.metrics_buffer", mock_metrics_buffer):
             result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
 
-            assert result.content[0].text is not None
+            assert result.is_error is False
             result_data = orjson.loads(result.content[0].text)
-            assert "response_text" in result_data
             assert len(result_data["response_text"]) == settings.rest_response_text_max_length
             assert f"Response truncated from {len(large_text)} to {settings.rest_response_text_max_length} characters" in caplog.text
 
     @pytest.mark.asyncio
     async def test_rest_tool_does_not_truncate_small_response(self, tool_service, mock_tool, mock_global_config_obj, test_db, caplog):
-        """REST tool does not truncate response text below the limit."""
+        """REST tool does not truncate response text below the limit.
+
+        Without an outputSchema the text is returned unchanged as a successful result (#6199).
+        """
         mock_tool.integration_type = "REST"
         mock_tool.request_type = "GET"
         mock_tool.jsonpath_filter = ""
@@ -6833,17 +7084,23 @@ class TestRestToolNonJsonResponses:
         with patch("mcpgateway.services.tool_service.metrics_buffer", mock_metrics_buffer):
             result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
 
+            assert result.is_error is False
             result_data = orjson.loads(result.content[0].text)
             assert result_data["response_text"] == small_text
             assert "Response truncated" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_rest_tool_truncation_respects_config_value(self, tool_service, mock_tool, mock_global_config_obj, test_db, caplog):
-        """REST tool truncation uses the configured REST_RESPONSE_TEXT_MAX_LENGTH value."""
+        """REST tool truncation uses the configured REST_RESPONSE_TEXT_MAX_LENGTH value.
+
+        With an outputSchema, a non-JSON body is reported as an error whose message
+        includes the configured limit (#6199).
+        """
         mock_tool.integration_type = "REST"
         mock_tool.request_type = "GET"
         mock_tool.jsonpath_filter = ""
         mock_tool.auth_value = None
+        mock_tool.output_schema = {"type": "object"}
 
         setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
 
@@ -6868,9 +7125,265 @@ class TestRestToolNonJsonResponses:
         ):
             result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
 
-            result_data = orjson.loads(result.content[0].text)
-            assert len(result_data["response_text"]) == 2000
+            # Error message includes the configured limit
+            assert result.is_error is True
+            assert "Response body is not valid JSON" in result.content[0].text
+            # Error message shows the patched limit (2000), not default (5000)
+            assert "Showing the first 2000 of 6000 characters" in result.content[0].text
+            # Truncated content is 2000 chars (matches patched setting)
+            assert "Y" * 2000 in result.content[0].text
             assert "Response truncated from 6000 to 2000 characters" in caplog.text
+            assert "outputSchema defined but no structured output" not in result.content[0].text
+
+    @pytest.mark.asyncio
+    async def test_rest_tool_non_json_with_output_schema_skips_jq_filter(self, tool_service, mock_tool, mock_global_config_obj, test_db, caplog):
+        """A non-JSON body on a schema tool reports the parse error without running the jq filter (#6199).
+
+        Feeding the parse-error TextContent to jq fails serialization and would replace the
+        useful truncation message with a generic "Error applying jsonpath filter".
+        """
+        mock_tool.integration_type = "REST"
+        mock_tool.request_type = "GET"
+        mock_tool.jsonpath_filter = ".results"
+        mock_tool.auth_value = None
+        mock_tool.output_schema = {"type": "object"}
+
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
+
+        large_text = '{"results": ["' + "Z" * 10000
+        mock_response = AsyncMock()
+        mock_response.raise_for_status = Mock()
+        mock_response.status_code = 200
+        mock_response.text = large_text
+        # Standard
+        import json
+
+        mock_response.json = Mock(side_effect=json.JSONDecodeError("Unterminated string", large_text, 13))
+
+        tool_service._http_client.get = AsyncMock(return_value=mock_response)
+
+        mock_metrics_buffer = Mock()
+        mock_metrics_buffer.record_tool_metric = Mock()
+        with patch("mcpgateway.services.tool_service.metrics_buffer", mock_metrics_buffer):
+            result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
+
+            assert result.is_error is True
+            assert "Response body is not valid JSON" in result.content[0].text
+            assert f"Showing the first {settings.rest_response_text_max_length} of {len(large_text)} characters" in result.content[0].text
+            assert "Error applying jsonpath filter" not in result.content[0].text
+            assert "jq filter failed" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_rest_tool_empty_body_with_output_schema_is_error(self, tool_service, mock_tool, mock_global_config_obj, test_db):
+        """An empty 200 body on a schema tool is an error, not a validation failure (#6199)."""
+        mock_tool.integration_type = "REST"
+        mock_tool.request_type = "GET"
+        mock_tool.jsonpath_filter = ""
+        mock_tool.auth_value = None
+        mock_tool.output_schema = {"type": "object"}
+
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
+
+        mock_response = AsyncMock()
+        mock_response.raise_for_status = Mock()
+        mock_response.status_code = 200
+        mock_response.text = ""
+        # Standard
+        import json
+
+        mock_response.json = Mock(side_effect=json.JSONDecodeError("Expecting value", "", 0))
+
+        tool_service._http_client.get = AsyncMock(return_value=mock_response)
+
+        mock_metrics_buffer = Mock()
+        mock_metrics_buffer.record_tool_metric = Mock()
+        with patch("mcpgateway.services.tool_service.metrics_buffer", mock_metrics_buffer):
+            result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
+
+            assert result.is_error is True
+            assert result.content[0].text == "Empty response body"
+
+    @pytest.mark.asyncio
+    async def test_rest_tool_nonstandard_2xx_json_list_body(self, tool_service, mock_tool, mock_global_config_obj, test_db, caplog):
+        """A 203 with a valid JSON array body is a tool error, not a JSON parse error."""
+        mock_tool.integration_type = "REST"
+        mock_tool.request_type = "GET"
+        mock_tool.jsonpath_filter = ""
+        mock_tool.auth_value = None
+
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
+
+        mock_response = AsyncMock()
+        mock_response.raise_for_status = Mock()
+        mock_response.status_code = 203
+        mock_response.text = '[{"id": 1}]'
+        mock_response.json = Mock(return_value=[{"id": 1}])
+
+        tool_service._http_client.get = AsyncMock(return_value=mock_response)
+
+        mock_metrics_buffer = Mock()
+        mock_metrics_buffer.record_tool_metric = Mock()
+        with patch("mcpgateway.services.tool_service.metrics_buffer", mock_metrics_buffer):
+            result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
+
+            assert result.is_error is True
+            assert result.content[0].text == "Tool error encountered"
+            assert "Failed to parse JSON" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_rest_tool_http_error_json_list_body(self, tool_service, mock_tool, mock_global_config_obj, test_db):
+        """A non-2xx JSON array body containing "error" is reported, not indexed like a dict."""
+        # Third-Party
+        import httpx
+
+        mock_tool.integration_type = "REST"
+        mock_tool.request_type = "GET"
+        mock_tool.jsonpath_filter = ""
+        mock_tool.auth_value = None
+
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
+
+        mock_response = AsyncMock()
+        mock_request = Mock(spec=httpx.Request)
+        mock_request.url = "https://api.example.com/test"
+        mock_response.raise_for_status = Mock(side_effect=httpx.HTTPStatusError("Server Error", request=mock_request, response=mock_response))
+        mock_response.status_code = 500
+        mock_response.text = '["error", "boom"]'
+        mock_response.json = Mock(return_value=["error", "boom"])
+
+        tool_service._http_client.get = AsyncMock(return_value=mock_response)
+
+        mock_metrics_buffer = Mock()
+        mock_metrics_buffer.record_tool_metric = Mock()
+        with patch("mcpgateway.services.tool_service.metrics_buffer", mock_metrics_buffer):
+            result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
+
+            assert result.is_error is True
+            assert result.content[0].text.startswith("HTTP 500:")
+            assert "boom" in result.content[0].text
+
+    @pytest.mark.asyncio
+    async def test_rest_tool_http_error_json_big_int_body(self, tool_service, mock_tool, mock_global_config_obj, test_db):
+        """A non-2xx JSON body with an out-of-range integer does not crash the gateway."""
+        # Third-Party
+        import httpx
+
+        mock_tool.integration_type = "REST"
+        mock_tool.request_type = "GET"
+        mock_tool.jsonpath_filter = ""
+        mock_tool.auth_value = None
+
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
+
+        mock_response = AsyncMock()
+        mock_request = Mock(spec=httpx.Request)
+        mock_request.url = "https://api.example.com/test"
+        mock_response.raise_for_status = Mock(side_effect=httpx.HTTPStatusError("Server Error", request=mock_request, response=mock_response))
+        mock_response.status_code = 500
+        mock_response.text = '{"code": 1000000000000000000000000000000}'
+        mock_response.json = Mock(return_value={"code": 10**30})
+
+        tool_service._http_client.get = AsyncMock(return_value=mock_response)
+
+        mock_metrics_buffer = Mock()
+        mock_metrics_buffer.record_tool_metric = Mock()
+        with patch("mcpgateway.services.tool_service.metrics_buffer", mock_metrics_buffer):
+            result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
+
+            assert result.is_error is True
+            assert result.content[0].text.startswith("HTTP 500:")
+            assert "1000000000000000000000000000000" in result.content[0].text
+
+    @pytest.mark.asyncio
+    async def test_rest_tool_http_error_json_body_is_truncated(self, tool_service, mock_tool, mock_global_config_obj, test_db):
+        """A non-2xx JSON body without an error key is echoed but bounded to the limit."""
+        # Third-Party
+        import httpx
+
+        mock_tool.integration_type = "REST"
+        mock_tool.request_type = "GET"
+        mock_tool.jsonpath_filter = ""
+        mock_tool.auth_value = None
+
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
+
+        body = '{"message": "' + "A" * 10000 + '"}'
+        mock_response = AsyncMock()
+        mock_request = Mock(spec=httpx.Request)
+        mock_request.url = "https://api.example.com/test"
+        mock_response.raise_for_status = Mock(side_effect=httpx.HTTPStatusError("Server Error", request=mock_request, response=mock_response))
+        mock_response.status_code = 500
+        mock_response.text = body
+        mock_response.json = Mock(return_value={"message": "A" * 10000})
+
+        tool_service._http_client.get = AsyncMock(return_value=mock_response)
+
+        mock_metrics_buffer = Mock()
+        mock_metrics_buffer.record_tool_metric = Mock()
+        with patch("mcpgateway.services.tool_service.metrics_buffer", mock_metrics_buffer):
+            result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
+
+            assert result.is_error is True
+            assert len(result.content[0].text) == len("HTTP 500: ") + settings.rest_response_text_max_length
+
+    @pytest.mark.asyncio
+    async def test_rest_tool_http_error_non_string_error_value_is_truncated(self, tool_service, mock_tool, mock_global_config_obj, test_db):
+        """A non-2xx JSON body whose 'error' value is not a string is still bounded to the limit."""
+        # Third-Party
+        import httpx
+
+        mock_tool.integration_type = "REST"
+        mock_tool.request_type = "GET"
+        mock_tool.jsonpath_filter = ""
+        mock_tool.auth_value = None
+
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
+
+        error_value = {"detail": "A" * 10000}
+        mock_response = AsyncMock()
+        mock_request = Mock(spec=httpx.Request)
+        mock_request.url = "https://api.example.com/test"
+        mock_response.raise_for_status = Mock(side_effect=httpx.HTTPStatusError("Server Error", request=mock_request, response=mock_response))
+        mock_response.status_code = 500
+        mock_response.text = orjson.dumps({"error": error_value}).decode()
+        mock_response.json = Mock(return_value={"error": error_value})
+
+        tool_service._http_client.get = AsyncMock(return_value=mock_response)
+
+        mock_metrics_buffer = Mock()
+        mock_metrics_buffer.record_tool_metric = Mock()
+        with patch("mcpgateway.services.tool_service.metrics_buffer", mock_metrics_buffer):
+            result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
+
+            assert result.is_error is True
+            assert len(result.content[0].text) <= settings.rest_response_text_max_length
+
+    @pytest.mark.asyncio
+    async def test_rest_tool_nonstandard_2xx_non_string_error_value_is_truncated(self, tool_service, mock_tool, mock_global_config_obj, test_db):
+        """A 203 JSON body whose 'error' value is not a string is still bounded to the limit."""
+        mock_tool.integration_type = "REST"
+        mock_tool.request_type = "GET"
+        mock_tool.jsonpath_filter = ""
+        mock_tool.auth_value = None
+
+        setup_db_execute_mock(test_db, mock_tool, mock_global_config_obj)
+
+        error_value = ["B" * 10000]
+        mock_response = AsyncMock()
+        mock_response.raise_for_status = Mock()
+        mock_response.status_code = 203
+        mock_response.text = orjson.dumps({"error": error_value}).decode()
+        mock_response.json = Mock(return_value={"error": error_value})
+
+        tool_service._http_client.get = AsyncMock(return_value=mock_response)
+
+        mock_metrics_buffer = Mock()
+        mock_metrics_buffer.record_tool_metric = Mock()
+        with patch("mcpgateway.services.tool_service.metrics_buffer", mock_metrics_buffer):
+            result = await tool_service.invoke_tool(test_db, "test_tool", {}, request_headers=None)
+
+            assert result.is_error is True
+            assert len(result.content[0].text) <= settings.rest_response_text_max_length
 
 
 class TestSchemaValidatorCaching:
@@ -9036,8 +9549,8 @@ class TestToolServiceBulkImport:
         registry_cache.invalidate_tools.assert_awaited_once()
         lookup_cache.invalidate.assert_has_awaits(
             [
-                call("bulk_tool_a", gateway_id="gw-1"),
-                call("bulk_tool_b", gateway_id=None),
+                call("bulk_tool_a", gateway_id="gw-1", affected_server_ids=None),
+                call("bulk_tool_b", gateway_id=None, affected_server_ids=()),
             ]
         )
         mock_admin_cache.invalidate_tags.assert_awaited_once()
@@ -9976,6 +10489,7 @@ class TestRustMcpExecutionPlan:
         mock_cache = AsyncMock()
         mock_cache.enabled = True
         mock_cache.get = AsyncMock(return_value=payload)
+        mock_cache.get_negative = AsyncMock(return_value=None)
         mock_cache.set = AsyncMock()
         mock_cache.set_negative = AsyncMock()
         return mock_cache
@@ -10058,6 +10572,7 @@ class TestRustMcpExecutionPlan:
             )
 
         build_payload.assert_called_once_with(exact_name_tool, selected_gateway)
+        cache.get.assert_awaited_once_with("helper", server_id="server-1")
         tool_service._http_client.get.assert_awaited_once_with("http://tool.example/invoke", params={}, headers={})
         assert result.content[0].text == '{\n  "ok": true\n}'
 
@@ -10338,24 +10853,36 @@ class TestRustMcpExecutionPlan:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("status", "error_match"),
+        ("status", "error_type", "error_match"),
         [
-            ("missing", "Tool not found"),
-            ("inactive", "exists but is inactive"),
-            ("offline", "currently offline"),
+            ("missing", ToolNotFoundError, "Tool not found"),
+            ("inactive", ToolNotFoundError, "exists but is inactive"),
+            ("offline", ToolNotFoundError, "currently offline"),
+            ("deprecated", ToolInvocationError, "is deprecated"),
         ],
     )
-    async def test_prepare_rust_mcp_tool_execution_respects_negative_cache_entries(self, tool_service, status, error_match):
-        """Negative cache entries should short-circuit with the expected error."""
-        cache = self._cache_mock({"status": status})
+    async def test_prepare_rust_mcp_tool_execution_respects_negative_cache_entries(self, tool_service, status, error_type, error_match):
+        """Caller-scoped negative entries should return the expected error."""
+        cache = self._cache_mock(None)
+        cache.get_negative.return_value = {"status": status}
 
         with (
             patch("mcpgateway.services.tool_service._get_tool_lookup_cache", return_value=cache),
             patch("mcpgateway.services.tool_service.current_trace_id", MagicMock(get=MagicMock(return_value=None))),
             patch.object(tool_service, "_get_plugin_manager", AsyncMock(return_value=None)),
         ):
-            with pytest.raises(ToolNotFoundError, match=error_match):
-                await tool_service.prepare_rust_mcp_tool_execution(MagicMock(), "tool-one")
+            with pytest.raises(error_type, match=error_match):
+                await tool_service.prepare_rust_mcp_tool_execution(MagicMock(), "tool-one", server_id="server-1")
+
+        caller_scope = tool_service._negative_cache_caller_scope(None, None)
+        cache.get_negative.assert_awaited_once_with("tool-one", caller_scope, "server-1")
+
+    def test_unknown_negative_cache_status_is_logged_and_ignored(self, tool_service, caplog):
+        """Unknown negative statuses must not become an implicit denial."""
+        with caplog.at_level(logging.WARNING, logger="mcpgateway.services.tool_service"):
+            tool_service._raise_for_negative_tool_status("tool-one", "future-status")
+
+        assert "Ignoring unknown negative tool cache status 'future-status' for tool tool-one" in caplog.text
 
     @pytest.mark.asyncio
     async def test_prepare_rust_mcp_tool_execution_direct_proxy_fallback(self, tool_service):
@@ -10633,8 +11160,8 @@ class TestRustMcpExecutionPlan:
                 await tool_service.prepare_rust_mcp_tool_execution(MagicMock(), "tool-one")
 
     @pytest.mark.asyncio
-    async def test_prepare_rust_mcp_tool_execution_marks_unreachable_tools_offline_and_caches_negative_result(self, tool_service):
-        """Unreachable DB-loaded tools should set a negative cache entry before failing."""
+    async def test_prepare_rust_mcp_tool_execution_caches_global_offline_result_with_gateway(self, tool_service):
+        """Global offline lookups cache caller-scoped negatives with their gateway."""
         cache = self._cache_mock(None)
         tool = SimpleNamespace(
             enabled=True,
@@ -10642,6 +11169,7 @@ class TestRustMcpExecutionPlan:
             visibility="public",
             team_id=None,
             owner_email=None,
+            gateway_id="gw-1",
             gateway=SimpleNamespace(),
         )
 
@@ -10654,7 +11182,9 @@ class TestRustMcpExecutionPlan:
             with pytest.raises(ToolNotFoundError, match="currently offline"):
                 await tool_service.prepare_rust_mcp_tool_execution(MagicMock(), "tool-one")
 
-        cache.set_negative.assert_awaited_once_with("tool-one", "offline")
+        caller_scope = tool_service._negative_cache_caller_scope(None, None)
+        cache.get_negative.assert_awaited_once_with("tool-one", caller_scope, None)
+        cache.set_negative.assert_awaited_once_with("tool-one", "offline", caller_scope, gateway_id="gw-1", server_id=None)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -10691,18 +11221,229 @@ class TestRustMcpExecutionPlan:
                 await tool_service.prepare_rust_mcp_tool_execution(MagicMock(), "tool-one", user_email="user@example.com", token_teams=["team-a"])
 
     @pytest.mark.asyncio
-    async def test_prepare_rust_mcp_tool_execution_rejects_server_scoped_cached_payload_without_tool_id(self, tool_service):
-        """Server-scoped cached payloads need a concrete tool id for membership checks."""
+    async def test_prepare_rust_mcp_tool_execution_falls_back_after_scope_invalid_cache_hit(self, tool_service):
+        """A cache hit from another tenant must not terminate Rust plan resolution."""
+        cached_tenant_a = self._cache_payload(id="tool-a", visibility="private", owner_email="a@example.com")
+        tenant_b_payload = self._cache_payload(
+            id="tool-b",
+            visibility="private",
+            owner_email="b@example.com",
+            integration_type="REST",
+            gateway_id="gw-b",
+            gateway={"id": "gw-b"},
+        )
+        cache = self._cache_mock(cached_tenant_a)
+        tenant_b_tool = SimpleNamespace(
+            enabled=True,
+            reachable=True,
+            visibility="private",
+            team_id=None,
+            owner_email="b@example.com",
+            gateway=SimpleNamespace(id="gw-b"),
+        )
+
+        async def _check_access(_db, payload, user_email, _token_teams):
+            return payload.get("owner_email") == user_email
+
+        with (
+            patch("mcpgateway.services.tool_service._get_tool_lookup_cache", return_value=cache),
+            patch.object(tool_service, "_load_invocable_tools", return_value=[tenant_b_tool]) as load_invocable_tools,
+            patch.object(tool_service, "_build_tool_cache_payload", return_value=tenant_b_payload),
+            patch.object(tool_service, "_check_tool_access", side_effect=_check_access),
+            patch.object(tool_service, "_get_plugin_manager", AsyncMock(return_value=None)),
+        ):
+            plan = await tool_service.prepare_rust_mcp_tool_execution(
+                MagicMock(),
+                "shared-tool",
+                user_email="b@example.com",
+                token_teams=["team-b"],
+                server_id="server-b",
+            )
+
+        assert plan == {"eligible": False, "fallbackReason": "unsupported-integration:REST"}
+        load_invocable_tools.assert_called_once()
+        cache.set.assert_awaited_once_with("shared-tool", tenant_b_payload, gateway_id="gw-b", server_id="server-b")
+
+    @pytest.mark.asyncio
+    async def test_python_resolution_falls_back_after_scope_invalid_cache_hit(self, tool_service):
+        """A cache hit from another tenant must not terminate Python resolution."""
+        cached_tenant_b = self._cache_payload(id="tool-b", visibility="private", owner_email="b@example.com")
+        tenant_a_payload = self._cache_payload(id="tool-a", visibility="private", owner_email="a@example.com", gateway_id="gw-a", gateway={"id": "gw-a"})
+        cache = self._cache_mock(cached_tenant_b)
+        tenant_a_tool = SimpleNamespace(
+            enabled=True,
+            reachable=True,
+            visibility="private",
+            team_id=None,
+            owner_email="a@example.com",
+            gateway=SimpleNamespace(id="gw-a"),
+        )
+
+        async def _check_access(_db, payload, user_email, _token_teams):
+            return payload.get("owner_email") == user_email
+
+        with (
+            patch("mcpgateway.services.tool_service._get_tool_lookup_cache", return_value=cache),
+            patch.object(tool_service, "_load_invocable_tools", return_value=[tenant_a_tool]) as load_invocable_tools,
+            patch.object(tool_service, "_build_tool_cache_payload", return_value=tenant_a_payload),
+            patch.object(tool_service, "_check_tool_access", side_effect=_check_access),
+        ):
+            resolved = await tool_service._resolve_tool_for_invocation(
+                MagicMock(),
+                "shared-tool",
+                None,
+                "a@example.com",
+                ["team-a"],
+                "server-a",
+                False,
+                False,
+            )
+
+        assert resolved.tool_payload["id"] == "tool-a"
+        load_invocable_tools.assert_called_once()
+        cache.set.assert_awaited_once_with("shared-tool", tenant_a_payload, gateway_id="gw-a", server_id="server-a")
+
+    @pytest.mark.asyncio
+    async def test_prepare_rust_mcp_tool_execution_falls_back_for_server_scoped_cached_payload_without_tool_id(self, tool_service):
+        """Malformed server-scoped cache entries must fall through to the DB lookup."""
         cache = self._cache_mock(self._cache_payload(id=None))
 
         with (
             patch("mcpgateway.services.tool_service._get_tool_lookup_cache", return_value=cache),
             patch("mcpgateway.services.tool_service.current_trace_id", MagicMock(get=MagicMock(return_value=None))),
+            patch.object(tool_service, "_load_invocable_tools", return_value=[]) as load_invocable_tools,
             patch.object(tool_service, "_check_tool_access", AsyncMock(return_value=True)),
+            patch("mcpgateway.services.tool_service.global_config_cache.get_passthrough_headers", return_value=[]),
             patch.object(tool_service, "_get_plugin_manager", AsyncMock(return_value=None)),
         ):
             with pytest.raises(ToolNotFoundError, match="Tool not found"):
                 await tool_service.prepare_rust_mcp_tool_execution(MagicMock(), "tool-one", server_id="srv-1")
+
+        load_invocable_tools.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_prepare_rust_mcp_tool_execution_rejects_detached_stale_cache_hit(self, tool_service):
+        """Rust resolution must reject stale cache data after failed cross-worker invalidation."""
+        cache = self._cache_mock(self._cache_payload(id="detached-tool"))
+        db = MagicMock()
+        db.execute.return_value.first.return_value = None
+
+        with (
+            patch("mcpgateway.services.tool_service._get_tool_lookup_cache", return_value=cache),
+            patch.object(tool_service, "_load_invocable_tools", return_value=[]) as load_invocable_tools,
+            patch.object(tool_service, "_get_plugin_manager", AsyncMock(return_value=None)),
+        ):
+            with pytest.raises(ToolNotFoundError, match="Tool not found"):
+                await tool_service.prepare_rust_mcp_tool_execution(db, "tool-one", server_id="server-1")
+
+        load_invocable_tools.assert_called_once_with(db, "tool-one", server_id="server-1")
+
+    @pytest.mark.asyncio
+    async def test_python_resolution_rejects_detached_stale_cache_hit(self, tool_service):
+        """Python resolution must reject stale cache data after failed cross-worker invalidation."""
+        cache = self._cache_mock(self._cache_payload(id="detached-tool"))
+        db = MagicMock()
+        db.execute.return_value.first.return_value = None
+
+        with (
+            patch("mcpgateway.services.tool_service._get_tool_lookup_cache", return_value=cache),
+            patch.object(tool_service, "_load_invocable_tools", return_value=[]) as load_invocable_tools,
+        ):
+            with pytest.raises(ToolNotFoundError, match="Tool not found"):
+                await tool_service._resolve_tool_for_invocation(
+                    db,
+                    "tool-one",
+                    None,
+                    None,
+                    None,
+                    "server-1",
+                    False,
+                    False,
+                )
+
+        load_invocable_tools.assert_called_once_with(db, "tool-one", server_id="server-1")
+
+    @pytest.mark.asyncio
+    async def test_python_resolution_isolates_negative_cache_by_caller(self, tool_service):
+        """One caller's offline result must not block another caller's valid lookup."""
+        cache = ToolLookupCache()
+        cache._enabled = True
+        cache._l2_enabled = False
+        offline_tool = SimpleNamespace(
+            id="tool-a",
+            name="tool-one",
+            enabled=True,
+            reachable=False,
+            gateway_id="gw-a",
+            gateway=SimpleNamespace(id="gw-a"),
+        )
+        online_tool = SimpleNamespace(
+            id="tool-b",
+            name="tool-one",
+            enabled=True,
+            reachable=True,
+            gateway_id="gw-b",
+            gateway=SimpleNamespace(id="gw-b"),
+        )
+        online_payload = self._cache_payload(
+            id="tool-b",
+            visibility="private",
+            owner_email="b@example.com",
+            gateway_id="gw-b",
+            gateway={"id": "gw-b"},
+        )
+
+        with (
+            patch("mcpgateway.services.tool_service._get_tool_lookup_cache", return_value=cache),
+            patch.object(tool_service, "_load_invocable_tools", side_effect=[[offline_tool], [online_tool]]),
+            patch.object(tool_service, "_build_tool_cache_payload", return_value=online_payload),
+            patch.object(tool_service, "_check_tool_access", AsyncMock(return_value=True)),
+        ):
+            with pytest.raises(ToolNotFoundError, match="currently offline"):
+                await tool_service._resolve_tool_for_invocation(
+                    MagicMock(),
+                    "tool-one",
+                    None,
+                    "a@example.com",
+                    ["team-a"],
+                    None,
+                    False,
+                    False,
+                )
+
+            resolved = await tool_service._resolve_tool_for_invocation(
+                MagicMock(),
+                "tool-one",
+                None,
+                "b@example.com",
+                ["team-b"],
+                None,
+                False,
+                False,
+            )
+
+        assert resolved.tool_payload["id"] == "tool-b"
+
+    @pytest.mark.asyncio
+    async def test_prepare_rust_mcp_tool_execution_uses_server_scoped_cache_for_aliases(self, tool_service):
+        """Server aliases should use their isolated server-scoped cache entries."""
+        cache = self._cache_mock(self._cache_payload())
+        db = MagicMock()
+
+        with (
+            patch("mcpgateway.services.tool_service._get_tool_lookup_cache", return_value=cache),
+            patch("mcpgateway.services.tool_service.current_trace_id", MagicMock(get=MagicMock(return_value=None))),
+            patch.object(tool_service, "_load_invocable_tools", return_value=[]) as load_invocable_tools,
+            patch.object(tool_service, "_check_tool_access", AsyncMock(return_value=True)),
+            patch("mcpgateway.services.tool_service.global_config_cache.get_passthrough_headers", return_value=[]),
+            patch.object(tool_service, "_get_plugin_manager", AsyncMock(return_value=None)),
+        ):
+            plan = await tool_service.prepare_rust_mcp_tool_execution(db, "tool-one", server_id="srv-1")
+
+        assert plan["eligible"] is True
+        cache.get.assert_awaited_once_with("tool-one", server_id="srv-1")
+        load_invocable_tools.assert_not_called()
+        db.execute.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_prepare_rust_mcp_tool_execution_uses_live_gateway_auth_fields_for_loaded_tools(self, tool_service):
@@ -10971,20 +11712,30 @@ class TestRustMcpExecutionPlan:
         assert plan["transport"] == "sse"
 
     @pytest.mark.asyncio
-    async def test_prepare_rust_mcp_tool_execution_checks_server_membership(self, tool_service):
-        """Server-scoped execution should reject tools not attached to the requested server."""
-        cache = self._cache_mock(self._cache_payload())
+    async def test_prepare_rust_mcp_tool_execution_routes_server_alias_to_original_name(self, tool_service):
+        """A server-scoped custom alias should invoke the upstream original name."""
+        cache = self._cache_mock(None)
+        cache_payload = self._cache_payload(original_name="upstream-tool")
+        gateway = SimpleNamespace(id="gw-1")
+        tool = SimpleNamespace(enabled=True, reachable=True, visibility="public", team_id=None, owner_email=None, gateway=gateway)
         db = MagicMock()
-        db.execute.return_value.first.return_value = None
 
         with (
             patch("mcpgateway.services.tool_service._get_tool_lookup_cache", return_value=cache),
             patch("mcpgateway.services.tool_service.current_trace_id", MagicMock(get=MagicMock(return_value=None))),
+            patch.object(tool_service, "_load_invocable_tools", return_value=[tool]) as load_invocable_tools,
+            patch.object(tool_service, "_build_tool_cache_payload", return_value=cache_payload),
             patch.object(tool_service, "_check_tool_access", AsyncMock(return_value=True)),
+            patch("mcpgateway.services.tool_service.global_config_cache.get_passthrough_headers", return_value=[]),
+            patch("mcpgateway.services.tool_service.compute_passthrough_headers_cached", return_value={}),
             patch.object(tool_service, "_get_plugin_manager", AsyncMock(return_value=None)),
         ):
-            with pytest.raises(ToolNotFoundError, match="Tool not found"):
-                await tool_service.prepare_rust_mcp_tool_execution(db, "tool-one", server_id="srv-1")
+            plan = await tool_service.prepare_rust_mcp_tool_execution(db, "Custom.Tool", server_id="srv-1")
+
+        assert plan["remoteToolName"] == "upstream-tool"
+        cache.get.assert_awaited_once_with("Custom.Tool", server_id="srv-1")
+        cache.set.assert_awaited_once_with("Custom.Tool", cache_payload, gateway_id="gw-1", server_id="srv-1")
+        load_invocable_tools.assert_called_once_with(db, "Custom.Tool", server_id="srv-1")
 
     @pytest.mark.asyncio
     async def test_prepare_rust_mcp_tool_execution_handles_query_param_auth_and_passthrough(self, tool_service):

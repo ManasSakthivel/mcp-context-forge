@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Literal, Optional, Pattern, Self, Union
 from urllib.parse import urlparse
 
 # Third-Party
+from mcp.shared.inbound import find_invalid_x_mcp_header
 import orjson
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, EmailStr, Field, field_serializer, field_validator, model_serializer, model_validator, SecretStr, ValidationInfo
 
@@ -568,6 +569,13 @@ class AuthenticationValues(BaseModelWithConfigDict):
 _DEFAULT_INPUT_SCHEMA: dict = {"type": "object", "properties": {}}
 
 
+def _reject_invalid_x_mcp_header(schema: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Reject an input schema whose ``x-mcp-header`` annotations break the MCP 2026-07-28 constraints."""
+    if schema is not None and (reason := find_invalid_x_mcp_header(schema)) is not None:
+        raise ValueError(f"invalid x-mcp-header annotation: {reason}")
+    return schema
+
+
 def _extract_rest_url_components(values: dict) -> dict:
     """Extract ``base_url`` and ``path_template`` from ``url`` for REST integration tools.
 
@@ -1018,6 +1026,12 @@ class ToolCreate(BaseModel):
             ValueError: If the filter uses a restricted jq built-in.
         """
         return _validate_jsonpath_filter_value(value)
+
+    @field_validator("input_schema")
+    @classmethod
+    def validate_x_mcp_header_annotations(cls, v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Reject ``x-mcp-header`` annotations that conforming MCP clients would drop the tool for."""
+        return _reject_invalid_x_mcp_header(v)
 
     @field_validator("headers", "input_schema", "annotations")
     @classmethod
@@ -1576,6 +1590,12 @@ class ToolUpdate(BaseModelWithConfigDict):
             ValueError: If the filter uses a restricted jq built-in.
         """
         return _validate_jsonpath_filter_value(value)
+
+    @field_validator("input_schema")
+    @classmethod
+    def validate_x_mcp_header_annotations(cls, v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Reject ``x-mcp-header`` annotations that conforming MCP clients would drop the tool for."""
+        return _reject_invalid_x_mcp_header(v)
 
     @field_validator("headers", "input_schema", "annotations")
     @classmethod
@@ -2383,6 +2403,7 @@ class ResourceUpdate(BaseModelWithConfigDict):
 
     uri: Optional[str] = Field(None, description="Unique URI for the resource")
     name: Optional[str] = Field(None, description="Human-readable resource name")
+    custom_name: Optional[str] = Field(None, description="Explicit resource base name; required to rename federated resources. Local names remain literal.")
     description: Optional[str] = Field(None, description="Resource description")
     title: Optional[str] = Field(None, max_length=255, description="Human-readable title for the resource (MCP BaseMetadata)")
     mime_type: Optional[str] = Field(None, description="Resource MIME type")
@@ -2408,6 +2429,19 @@ class ResourceUpdate(BaseModelWithConfigDict):
             List of validated tag strings or None if input is None
         """
         return validate_tags_field(v)
+
+    @field_validator("custom_name")
+    @classmethod
+    def validate_custom_name(cls, v: Optional[str]) -> Optional[str]:
+        """Validate an explicit rename without changing the legacy name contract.
+
+        Args:
+            v: Requested base name, or None to use legacy name handling.
+
+        Returns:
+            Validated name or None.
+        """
+        return SecurityValidator.validate_name(v, "Resource name") if v is not None else None
 
     @field_validator("name")
     @classmethod
@@ -2523,6 +2557,8 @@ class ResourceRead(BaseModelWithConfigDict):
     id: str = Field(description="Unique ID of the resource")
     uri: str
     name: str
+    original_name: Optional[str] = Field(None, description="Upstream name for federated resources; initial naming history for local resources")
+    custom_name_slug: Optional[str] = Field(None, description="Slugified base used to compose the namespaced name")
     description: Optional[str]
     mime_type: Optional[str]
     gateway_id: Optional[str] = Field(None, description="ID of the gateway for the resource")
@@ -9444,11 +9480,6 @@ class PydanticA2AAgent(BaseModelWithConfigDict):
     auth_type: Optional[str] = Field(None, description="Authentication type")
     content_type: Optional[str] = Field(None, description="Content-Type of the inbound request")
     endpoint_url: Optional[str] = Field(None, description="Registered endpoint URL for the agent, as configured at registration time")
-
-    class Config:
-        """Pydantic config for A2A agent metadata."""
-
-        from_attributes = True  # SQLAlchemy ORM compatibility
 
 
 class A2AAgentPluginBindingRequest(BaseModelWithConfigDict):
