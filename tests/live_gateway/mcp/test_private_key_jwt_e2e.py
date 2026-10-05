@@ -267,26 +267,30 @@ def private_key_jwt_gateway(admin_api: APIRequestContext, stub_stack: dict[str, 
     gateway_id = gateway["id"]
     logger.info("Registered private_key_jwt gateway %s (id=%s)", name, gateway_id)
 
-    deadline = time.monotonic() + _SYNC_DEADLINE
-    tool_name: str | None = None
-    while time.monotonic() < deadline:
-        tools_resp = admin_api.get(f"/tools?limit=0&gateway_id={gateway_id}")
-        if tools_resp.status == 200:
-            tools = tools_resp.json()
-            matched = [tool for tool in tools if tool.get("name", "").endswith("-stub-echo")]
-            if matched:
-                tool_name = matched[0]["name"]
-                break
-        time.sleep(1.0)
-    if tool_name is None:
-        raise AssertionError(f"Gateway {name} did not publish stub_echo within {_SYNC_DEADLINE}s")
-
-    yield {"id": gateway_id, "name": name, "tool_name": tool_name}
-
+    # The row exists from here on, so every exit path must delete it. Without the
+    # try/finally, the tool-sync timeout below raises after creation and leaves an
+    # orphaned gateway that the next run collides with on the unique name.
     try:
-        admin_api.delete(f"/gateways/{gateway_id}")
-    except Exception:  # noqa: BLE001
-        logger.warning("Failed to delete gateway %s during teardown", gateway_id)
+        deadline = time.monotonic() + _SYNC_DEADLINE
+        tool_name = None
+        while time.monotonic() < deadline:
+            tools_resp = admin_api.get("/tools")
+            if tools_resp.status == 200:
+                tools = tools_resp.json()
+                matched = [tool for tool in tools if tool.get("name", "").endswith("-stub-echo")]
+                if matched:
+                    tool_name = matched[0]["name"]
+                    break
+            time.sleep(1.0)
+        if tool_name is None:
+            raise AssertionError(f"Gateway {name} did not publish stub_echo within {_SYNC_DEADLINE}s")
+
+        yield {"id": gateway_id, "name": name, "tool_name": tool_name}
+    finally:
+        try:
+            admin_api.delete(f"/gateways/{gateway_id}")
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to delete gateway %s during teardown", gateway_id)
 
 
 @pytest.fixture
@@ -343,6 +347,11 @@ def _verify_assertion(stub_stack: dict[str, Any], token_request: OrderedDict[str
     assertion = token_request.get("client_assertion")
     assert assertion and isinstance(assertion, str), "missing client_assertion"
 
+    # The point of private_key_jwt is that no shared secret crosses the wire.
+    # Asserting the assertion is present does not prove that, since a fallback
+    # could send both.
+    assert "client_secret" not in token_request, "private_key_jwt must not send a client_secret"
+
     claims = pyjwt.decode(assertion, stub_stack["public_pem"], algorithms=["RS256"], audience=stub_stack["token_url"])
     assert claims["iss"] == _STUB_CLIENT_ID
     assert claims["sub"] == _STUB_CLIENT_ID
@@ -355,6 +364,9 @@ def _verify_assertion(stub_stack: dict[str, Any], token_request: OrderedDict[str
     header = pyjwt.get_unverified_header(assertion)
     assert header.get("alg") == "RS256"
     assert header.get("kid") == _STUB_KEY_ID
+    # HS* or "none" would mean the gateway signed with something other than the
+    # configured asymmetric key.
+    assert header.get("alg") not in ("none", "HS256", "HS384", "HS512")
 
 
 # ---------------------------------------------------------------------------

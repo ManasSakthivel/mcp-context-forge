@@ -47,7 +47,7 @@ CLIENT_ASSERTION_TYPE_JWT_BEARER: str = "urn:ietf:params:oauth:client-assertion-
 
 # Asymmetric signing algorithms allowed for private_key_jwt client
 # assertions. Symmetric HS* and the "none" algorithm are intentionally
-# excluded: the gateways signs outbound assertions with asymmetric key
+# excluded: the gateway signs outbound assertions with asymmetric key
 # material and must never fall back to a shared-secret or unsigned mode.
 SUPPORTED_TOKEN_ENDPOINT_SIGNING_ALGS: frozenset[str] = frozenset(
     {
