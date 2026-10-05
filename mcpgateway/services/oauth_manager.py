@@ -576,15 +576,27 @@ class OAuthManager:
             raise OAuthError("Failed to sign client assertion for private_key_jwt client authentication") from exc
 
     async def _refresh_client_assertion(self, token_data: Any, runtime_credentials: Dict[str, Any]) -> None:
-        """Regenerate client assertion before retry if using private_key_jwt.
+        """Regenerate the client assertion before a retry when using private_key_jwt.
+
+        A client assertion carries a short ``exp`` (RFC 7523 Section 3), so reusing
+        the one built for the first attempt can present an expired assertion on a
+        retry. Each attempt therefore gets a freshly signed assertion.
+
+        Normalization must match ``_apply_token_endpoint_auth`` exactly. If this
+        function read the method differently, a config the dispatch head signs with
+        private_key_jwt could be one this function declines to refresh, which sends
+        a stale assertion rather than failing.
 
         Args:
-            token_data: Token request form data to update (dict or list of tuples for form encoding).
-            runtime_credentials: Runtime OAuth config.
+            token_data: Token request form data to update. Accepts a dict or the
+                list-of-tuples form used for repeated form keys.
+            runtime_credentials: Runtime-ready OAuth configuration after decryption.
         """
         auth_method = runtime_credentials.get("token_endpoint_auth_method", "client_secret_post")
         if auth_method is None or (isinstance(auth_method, str) and not auth_method.strip()):
             auth_method = "client_secret_post"
+        if isinstance(auth_method, str):
+            auth_method = auth_method.strip()
         if auth_method == "private_key_jwt":
             new_assertion = await self._build_client_assertion(runtime_credentials)
             if isinstance(token_data, dict):
@@ -639,6 +651,16 @@ class OAuthManager:
             auth_method = "client_secret_post"
         if isinstance(auth_method, str):
             auth_method = auth_method.strip()
+
+        # Validate the method before any per-method branch. A structurally invalid
+        # method must not be reportable as a missing-client_id problem, and must
+        # never reach the client_secret_post tail, which is the fallback the
+        # docstring promises an unknown method never gets.
+        if not isinstance(auth_method, str):
+            raise OAuthError("Unsupported token_endpoint_auth_method - must be a string")
+        if auth_method not in SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS:
+            raise OAuthError(f"Unsupported token_endpoint_auth_method. Supported values: {', '.join(sorted(SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS))}")
+
         client_id = runtime_credentials.get("client_id")
         client_secret = runtime_credentials.get("client_secret")
 
@@ -672,12 +694,6 @@ class OAuthManager:
                 token_data["client_id"] = client_id
             logger.debug("Using private_key_jwt client assertion for token endpoint authentication")
             return
-
-        if not isinstance(auth_method, str):
-            raise OAuthError("Unsupported token_endpoint_auth_method - must be a string")
-
-        if auth_method not in SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS:
-            raise OAuthError("Unsupported token_endpoint_auth_method. Supported values: {', '.join(sorted(SUPPORTED_TOKEN_ENDPOINT_AUTH_METHODS))}")
 
         # Default: client_secret_post with a shared secret (RFC 6749 Section 2.3.1).
         if client_id:
