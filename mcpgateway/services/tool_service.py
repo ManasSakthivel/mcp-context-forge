@@ -1153,7 +1153,6 @@ class ResolvedTool:
     schema_validation_error: Optional[str] = None
 
 
-
 async def _call_upstream_tool(
     session: Any,
     tool_name: str,
